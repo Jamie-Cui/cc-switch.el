@@ -232,9 +232,20 @@ When READONLY is non-nil, open in read-only mode."
                   (list "cc-switch.db does not exist; run cc-switch-cli once to migrate config.json"))
         (signal 'cc-switch-error
                 (list (format "cc-switch.db does not exist: %s" path)))))
-    (let ((db (sqlite-open path readonly)))
+    (let ((db (cc-switch--sqlite-open-file path readonly)))
       (sqlite-execute db "PRAGMA busy_timeout = 1000")
       db)))
+
+(defun cc-switch--sqlite-open-file (path &optional readonly)
+  "Open SQLite database PATH.
+READONLY is honored on Emacs builds whose `sqlite-open' supports it.
+Emacs 29 accepts only PATH, so READONLY is ignored there."
+  (condition-case nil
+      (if readonly
+          (apply #'sqlite-open (list path readonly))
+        (sqlite-open path))
+    (wrong-number-of-arguments
+     (sqlite-open path))))
 
 (defmacro cc-switch--with-db (binding &rest body)
   "Open a SQLite database for BODY.

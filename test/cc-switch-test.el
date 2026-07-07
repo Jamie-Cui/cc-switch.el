@@ -1,6 +1,7 @@
 ;;; cc-switch-test.el --- Tests for cc-switch.el -*- lexical-binding: t; -*-
 
 (require 'ert)
+(require 'cl-lib)
 (require 'json)
 (require 'sqlite)
 (require 'cc-switch)
@@ -24,10 +25,25 @@
       (puthash (pop pairs) (pop pairs) table))
     table))
 
+(ert-deftest cc-switch-sqlite-open-file-falls-back-to-one-arg ()
+  "Open SQLite files on Emacs builds without a READONLY argument."
+  (let (calls)
+    (cl-letf (((symbol-function 'sqlite-open)
+               (lambda (&rest args)
+                 (push args calls)
+                 (unless (= (length args) 1)
+                   (signal 'wrong-number-of-arguments
+                           (list 'sqlite-open (length args))))
+                 :db)))
+      (should (eq (cc-switch--sqlite-open-file "/tmp/cc-switch.db" t) :db))
+      (should (equal (nreverse calls)
+                     '(("/tmp/cc-switch.db" t)
+                       ("/tmp/cc-switch.db")))))))
+
 (defun cc-switch-test--write-db (path rows &optional settings)
   "Create cc-switch test database PATH with provider ROWS and SETTINGS."
   (make-directory (file-name-directory path) t)
-  (let ((db (sqlite-open path nil)))
+  (let ((db (cc-switch--sqlite-open-file path)))
     (unwind-protect
         (progn
           (sqlite-execute
