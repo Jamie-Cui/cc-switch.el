@@ -222,9 +222,14 @@
                 :settings (cc-switch-test--json settings) :current t)
           (list :id "new" :app "codex" :name "New"
                 :settings (cc-switch-test--json settings)))))
-      (let ((features (remq 'toml features)))
-        (should-error (cc-switch-provider-switch "codex" "new")
-                      :type 'cc-switch-error))
+      (let ((real-require (symbol-function 'require)))
+        (cl-letf (((symbol-function 'require)
+                   (lambda (feature &optional filename noerror)
+                     (if (eq feature 'toml)
+                         nil
+                       (funcall real-require feature filename noerror)))))
+          (should-error (cc-switch-provider-switch "codex" "new")
+                        :type 'cc-switch-error)))
       (should (equal (cc-switch-provider-current "codex") "old")))))
 
 (ert-deftest cc-switch-codex-third-party-preserves-auth ()
