@@ -1,5 +1,9 @@
 # agent-switch.el
 
+[![Test](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/test.yml/badge.svg)](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/test.yml)
+[![Coverage](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/coverage.yml/badge.svg)](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/coverage.yml)
+[![Melpazoid](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/melpazoid.yml/badge.svg)](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/melpazoid.yml)
+
 `agent-switch.el` is an Emacs control panel for selecting provider profiles
 used by LLM agent clients. It includes adapters for Claude Code, Codex, gptel
 global defaults, and OpenCode global configuration. Additional clients,
