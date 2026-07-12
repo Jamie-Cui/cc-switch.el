@@ -673,6 +673,68 @@
       (should (equal (gethash "machine" authinfo) "relay.example.com"))
       (should (equal (gethash "login" authinfo) "codex.relay.api-key")))))
 
+(ert-deftest agent-switch-codex-discovers-all-provider-tables ()
+  (agent-switch-test--with-root root
+    (make-directory agent-switch-codex-home t)
+    (write-region
+     (concat
+      "model = \"gpt-test\"\n"
+      "model_provider = \"openai\"\n\n"
+      "[model_providers.sss]\n"
+      "name = \"sss\"\n"
+      "base_url = \"https://codex1.sssaicode.com/api/v1\"\n"
+      "wire_api = \"responses\"\n"
+      "env_key = \"SSS_API_KEY\"\n\n"
+      "[model_providers.openrouter]\n"
+      "name = \"openrouter\"\n"
+      "base_url = \"https://openrouter.ai/api/v1\"\n"
+      "env_key = \"OPENROUTER_API_KEY\"\n")
+     nil (agent-switch--codex-config-path))
+    (let ((process-environment (copy-sequence process-environment)))
+      (setenv "SSS_API_KEY" "must-not-be-captured")
+      (let* ((profiles (agent-switch-profiles "codex"))
+             (sss (cl-find "sss" profiles
+                           :key #'agent-switch-profile-id :test #'equal))
+             (openrouter
+              (cl-find "openrouter" profiles
+                       :key #'agent-switch-profile-id :test #'equal)))
+        (should (equal (mapcar #'agent-switch-profile-id profiles)
+                       '("openrouter" "sss")))
+        (dolist (profile profiles)
+          (should (eq (agent-switch-profile-ownership profile) 'external))
+          (should (equal (agent-switch-profile-source profile)
+                         (agent-switch--codex-config-path)))
+          (should (equal (gethash "model"
+                                  (agent-switch-profile-payload profile))
+                         "gpt-test"))
+          (should (agent-switch--profile-action-required-p profile)))
+        (let* ((payload (agent-switch-profile-payload sss))
+               (provider (gethash "provider" payload))
+               (credential (gethash "credential" payload))
+               (authinfo (gethash "authinfo" credential)))
+          (should (equal (agent-switch-profile-name sss) "sss"))
+          (should-not (gethash "env_key" provider))
+          (should (equal (gethash "machine" authinfo)
+                         "codex1.sssaicode.com"))
+          (should (equal (gethash "login" authinfo)
+                         "codex.sss.api-key"))
+          (should-not (string-match-p
+                       "must-not-be-captured" (format "%S" payload))))
+        (let* ((credential
+                (gethash "credential"
+                         (agent-switch-profile-payload openrouter)))
+               (authinfo (gethash "authinfo" credential)))
+          (should (equal (gethash "machine" authinfo) "openrouter.ai"))
+          (should (equal (gethash "login" authinfo)
+                         "codex.openrouter.api-key")))
+        (write-region
+         (concat
+          "machine codex1.sssaicode.com login codex.sss.api-key password one\n"
+          "machine openrouter.ai login codex.openrouter.api-key password two\n")
+         nil agent-switch-authinfo-file)
+        (dolist (profile profiles)
+          (should-not (agent-switch--profile-action-required-p profile)))))))
+
 (ert-deftest agent-switch-codex-validation-requires-command-credential ()
   (agent-switch-test--with-root root
     (let* ((credential (agent-switch-test--secret-reference
@@ -782,6 +844,10 @@
       (should (equal (gethash "delivery" credential) "command"))
       (should (equal (gethash "machine" authinfo) "api.openai.com"))
       (should (equal (gethash "login" authinfo) "codex.openai.api-key"))
+      (let ((comments (append (gethash "comments" authinfo) nil)))
+        (should (= (length comments) 2))
+        (should (string-match-p "config\\.toml" (car comments)))
+        (should (string-match-p "auth\\.json" (cadr comments))))
       (cl-letf (((symbol-function 'auth-source-search)
                  (lambda (&rest _arguments) nil)))
         (should (string-match-p
@@ -1258,21 +1324,31 @@
                     "ANTHROPIC_BASE_URL" "https://relay.example.com/api"
                     "ANTHROPIC_AUTH_TOKEN"
                     (agent-switch--secret-marker "do-not-store"))))
-           (capture (agent-switch--capture-current client current nil))
+           (capture
+            (funcall
+             (agent-switch-adapter-callback
+              (agent-switch-get-adapter 'claude) :capture-current)
+             client current nil))
            (payload (agent-switch-capture-result-payload capture))
            (reference (gethash "ANTHROPIC_AUTH_TOKEN"
                                (gethash "env" payload)))
            (authinfo (gethash "authinfo" reference)))
-      (dolist (adapter-id '(claude codex opencode))
+      (dolist (entry '((claude . agent-switch--claude-capture-current)
+                       (codex . agent-switch--codex-capture-current)
+                       (opencode . agent-switch--opencode-capture-current)))
         (should (eq (agent-switch-adapter-callback
-                     (agent-switch-get-adapter adapter-id) :capture-current)
-                    #'agent-switch--capture-current)))
+                     (agent-switch-get-adapter (car entry)) :capture-current)
+                    (cdr entry))))
       (should (agent-switch-capture-result-complete-p capture))
       (should-not (agent-switch-capture-result-warnings capture))
       (should (equal (gethash "source" reference) "auth-source"))
       (should (equal (gethash "machine" authinfo) "relay.example.com"))
       (should (equal (gethash "login" authinfo)
                      "env.ANTHROPIC_AUTH_TOKEN"))
+      (let ((comments (append (gethash "comments" authinfo) nil)))
+        (should (= (length comments) 2))
+        (should (string-match-p "settings\\.json" (car comments)))
+        (should (string-match-p "apiKeyHelper" (cadr comments))))
       (should-not (string-match-p "do-not-store" (format "%S" payload))))))
 
 (ert-deftest agent-switch-capture-generates-nested-auth-source-placeholders ()
@@ -1286,7 +1362,11 @@
                                     "apiKey"
                                     (agent-switch--secret-marker
                                      "do-not-store")))))
-           (capture (agent-switch--capture-current client current nil))
+           (capture
+            (funcall
+             (agent-switch-adapter-callback
+              (agent-switch-get-adapter 'opencode) :capture-current)
+             client current nil))
            (reference (gethash
                        "apiKey"
                        (gethash "options"
@@ -1298,7 +1378,11 @@
       (should (equal (gethash "source" reference) "auth-source"))
       (should (equal (gethash "machine" authinfo) "relay.example.com"))
       (should (equal (gethash "login" authinfo)
-                     "provider.options.apiKey")))))
+                     "provider.options.apiKey"))
+      (let ((comments (append (gethash "comments" authinfo) nil)))
+        (should (= (length comments) 2))
+        (should (string-match-p "opencode/auth\\.json" (car comments)))
+        (should (string-match-p "options\\.apiKey" (cadr comments)))))))
 
 (ert-deftest agent-switch-capture-falls-back-to-client-id-for-authinfo-machine ()
   (agent-switch-test--with-root root
@@ -1309,7 +1393,11 @@
              "provider" (agent-switch-test--hash
                          "api_key"
                          (agent-switch--secret-marker "do-not-store"))))
-           (capture (agent-switch--capture-current client current nil))
+           (capture
+            (funcall
+             (agent-switch-adapter-callback
+              (agent-switch-get-adapter 'codex) :capture-current)
+             client current nil))
            (reference
             (gethash "api_key"
                      (gethash "provider"
@@ -1536,6 +1624,17 @@
                  (lambda (path) (setq opened path))))
         (agent-switch-profile-edit))
       (should (equal opened (agent-switch-profile-source profile))))))
+
+(ert-deftest agent-switch-provider-modules-load-and-reregister ()
+  (agent-switch-test--with-root root
+    (dolist (feature '(agent-switch-adapter-utils
+                       agent-switch-claude
+                       agent-switch-codex
+                       agent-switch-opencode))
+      (should (featurep feature)))
+    (agent-switch-register-builtins)
+    (should (equal (mapcar #'agent-switch-client-id (agent-switch-clients))
+                   '("claude" "codex" "opencode")))))
 
 (ert-deftest agent-switch-builtins-provide-profile-templates ()
   (agent-switch-test--with-root root

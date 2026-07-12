@@ -46,7 +46,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         LOCAL_REPO: ${{ github.workspace }}
         # RECIPE is your recipe as written for MELPA:
-        RECIPE: (agent-switch :fetcher github :repo "Jamie-Cui/agent-switch.el" :files ("agent-switch-core.el" "agent-switch-storage.el" "agent-switch-adapters.el" "agent-switch-authinfo.el" "agent-switch-operations.el" "agent-switch-ui.el" "agent-switch.el"))
+        RECIPE: (agent-switch :fetcher github :repo "Jamie-Cui/agent-switch.el" :files ("agent-switch-core.el" "agent-switch-storage.el" "agent-switch-adapter-utils.el" "agent-switch-claude.el" "agent-switch-codex.el" "agent-switch-opencode.el" "agent-switch-authinfo.el" "agent-switch-operations.el" "agent-switch-ui.el" "agent-switch.el"))
         # set this to true if warnings should be treated as errors:
         WARN_IS_ERROR: false
         # set this to false (or remove it) if the package isn't on MELPA:

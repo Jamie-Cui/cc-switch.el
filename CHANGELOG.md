@@ -11,6 +11,9 @@
   protocols.
 - Added built-in Claude Code, Codex, and OpenCode
   Adapters with transactional activation and recovery.
+- Split shared adapter mechanisms and the Claude Code, Codex, and OpenCode
+  implementations into focused modules registered by the main package entry
+  point.
 - Replaced `tabulated-list-mode` with an internal section dashboard supporting
   Client folding without a `magit-section` dependency.
 - Used standard `hl-line-mode` row highlighting and single-line Profile rows.
@@ -46,6 +49,9 @@
 - Generate auth-source placeholders for every captured secret, deriving
   `authinfo.machine` from the provider Base URL and `authinfo.login` from the
   full secret field path, so users only need to add matching authinfo entries.
+- Add provider-specific `authinfo.comments` hints to generated references so
+  Profiles identify likely pre-adoption secret locations without changing
+  lookup or current-state matching.
 - Mark Profiles as `(action required)` dynamically when an auth-source
   reference has no matching secret entry, its Adapter validation fails, or its
   payload schema is stale; refreshing clears resolvable conditions.
@@ -56,6 +62,9 @@
   authinfo credentials for remote providers; Adopt converts legacy `env_key`
   configuration and Apply writes Codex command-backed provider authentication
   without placing the API key in Profile JSON, state, or TOML.
+- Discover every Codex `model_providers.<id>` table as a read-only Profile,
+  reusing the global model fields and converting `env_key` metadata into
+  authinfo references without reading environment variable contents.
 - Represented Codex's built-in OpenAI provider semantically as `openai` and
   materialized it as `agent-switch-openai` for authinfo-managed API-key access.
   Native OAuth credentials and `~/.codex/auth.json` remain untouched and

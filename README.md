@@ -71,6 +71,9 @@ explicitly return an incomplete capture; those Profiles display
 `(action required)`. Profiles whose auth-source references have no matching
 entry also display `(action required)`; refresh the dashboard after adding the
 entry. Apply still performs the authoritative secret check and validation.
+Generated authinfo objects include a `comments` array describing likely
+pre-adoption secret locations for Claude Code, Codex, or OpenCode. These hints
+are metadata and do not participate in lookup or current-state matching.
 `RET` visits the managed Profile JSON using the user's normal Emacs file mode.
 Editing and saving never applies a Profile automatically; Apply is always
 explicit. Operation failures are logged through `message` to `*Messages*` and
@@ -111,6 +114,12 @@ are the only credential-free built-ins. Adopt converts a legacy provider
 name. Apply verifies that the authinfo entry exists and writes Codex's
 `model_providers.<id>.auth` command configuration. At request time, Codex runs
 the bundled batch Emacs helper, which writes only the token to standard output.
+
+Every `model_providers.<id>` table in the global Codex config is discovered as
+a read-only Profile using the global `model` and optional `small_model` values.
+Refresh the dashboard after editing `config.toml`. Discovered `env_key` values
+become command-delivered authinfo references; environment variable contents are
+never read or copied. Use Copy to create an editable managed Profile.
 
 The semantic Profile provider ID `openai` is materialized as the private live
 provider ID `agent-switch-openai`, because Codex reserves its built-in `openai`
@@ -192,6 +201,16 @@ agent-switch reads one explicit authinfo file. It defaults to
 (setq agent-switch-authinfo-file
       (expand-file-name "agent-switch.authinfo.gpg" user-emacs-directory))
 ```
+
+To use an existing plaintext `~/.authinfo` file instead:
+
+```elisp
+(setq agent-switch-authinfo-file
+      (expand-file-name "~/.authinfo"))
+```
+
+Keep plaintext authinfo files readable only by their owner (for example, mode
+`600`). Prefer an encrypted `.gpg` file when practical.
 
 For captured provider configuration using `https://relay.example.com/api`,
 agent-switch automatically writes an auth-source placeholder for every secret:
@@ -365,6 +384,18 @@ Managed Create starts from the Adapter's optional `:profile-template` JSON
 object. Edit visits the Profile JSON file directly.
 
 ## Development
+
+Built-in adapter code is split by responsibility:
+
+```text
+agent-switch-adapter-utils.el  shared adapter mechanisms
+agent-switch-claude.el         Claude Code adapter
+agent-switch-codex.el          Codex adapter
+agent-switch-opencode.el       OpenCode adapter
+agent-switch.el                package loading and built-in registration
+```
+
+Provider modules depend on the shared mechanisms, never on one another.
 
 ```sh
 make compile

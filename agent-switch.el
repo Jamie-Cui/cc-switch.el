@@ -27,7 +27,18 @@
 
 (require 'agent-switch-core)
 (require 'agent-switch-storage)
-(require 'agent-switch-adapters)
+(require 'agent-switch-claude)
+(require 'agent-switch-codex)
+(require 'agent-switch-opencode)
+
+(defun agent-switch-register-builtins ()
+  "Register all built-in adapters and clients in dashboard order."
+  (agent-switch-register-claude)
+  (agent-switch-register-codex)
+  (agent-switch-register-opencode))
+
+(agent-switch-register-builtins)
+
 (require 'agent-switch-operations)
 (require 'agent-switch-ui)
 

@@ -9,7 +9,16 @@ LOADPATH = -L .
 
 BYTE_COMPILE_FLAGS = --eval "(setq byte-compile-error-on-warn nil)"
 
-SRCS = agent-switch-authinfo.el agent-switch-core.el agent-switch-storage.el agent-switch-adapters.el agent-switch-operations.el agent-switch-ui.el agent-switch.el
+SRCS = agent-switch-authinfo.el \
+	agent-switch-core.el \
+	agent-switch-storage.el \
+	agent-switch-adapter-utils.el \
+	agent-switch-claude.el \
+	agent-switch-codex.el \
+	agent-switch-opencode.el \
+	agent-switch-operations.el \
+	agent-switch-ui.el \
+	agent-switch.el
 COMPILED = $(SRCS:.el=.elc)
 
 .PHONY: all compile clean test test-unit help
