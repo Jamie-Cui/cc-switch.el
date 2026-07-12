@@ -20,7 +20,7 @@
 
 ;; agent-switch is an extensible dashboard for selecting provider profiles
 ;; used by LLM agent clients.  Built-in adapters support Claude Code, Codex,
-;; gptel defaults, and OpenCode global configuration.  Third-party clients,
+;; and OpenCode global configuration.  Third-party clients,
 ;; adapters, and profiles can be registered entirely from Emacs Lisp.
 
 ;;; Code:
@@ -28,6 +28,7 @@
 (require 'agent-switch-core)
 (require 'agent-switch-storage)
 (require 'agent-switch-adapters)
+(require 'agent-switch-operations)
 (require 'agent-switch-ui)
 
 ;;;###autoload

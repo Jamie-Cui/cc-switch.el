@@ -24,7 +24,7 @@
 
 (cl-defstruct (agent-switch-adapter
                (:constructor agent-switch--make-adapter))
-  id name callbacks)
+  id name callbacks payload-version)
 
 (cl-defstruct (agent-switch-client
                (:constructor agent-switch--make-client))
@@ -32,11 +32,19 @@
 
 (cl-defstruct (agent-switch-profile
                (:constructor agent-switch--make-profile))
-  id client-id name payload ownership source source-hash valid-p error)
+  id client-id name payload ownership source source-hash valid-p error
+  payload-version setup-required-p warnings)
 
 (cl-defstruct (agent-switch-job
                (:constructor agent-switch-job-create))
   starter canceler)
+
+(cl-defstruct (agent-switch-capture-result
+               (:constructor agent-switch-capture-result-create))
+  payload complete-p warnings)
+
+(defconst agent-switch-json-null :null)
+(defconst agent-switch-json-false :false)
 
 (defvar agent-switch--adapters (make-hash-table :test #'equal)
   "Registered adapters keyed by string ID.")
@@ -58,8 +66,14 @@
 
 (defconst agent-switch--callback-keys
   '(:current :activate :validate :discover :snapshot :rollback
-    :profile-current-p :watch-paths :watch-setup :profile-template)
+    :profile-current-p :capture-current :watch-paths :watch-setup
+    :profile-template :profile-columns)
   "Recognized adapter callback keys.")
+
+(defconst agent-switch--sensitive-key-regexp
+  (rx (or "token" "secret" "password" "api-key" "api_key" "apikey"
+          "authorization" "auth-token" "auth_token"))
+  "Case-insensitive regexp identifying secret-bearing JSON keys.")
 
 (defun agent-switch--validate-properties (properties allowed kind)
   "Ensure PROPERTIES is a plist containing only ALLOWED keys for KIND."
@@ -99,6 +113,84 @@
            "<redacted>" message-text t))
     message-text))
 
+(defun agent-switch-secret-reference-p (value)
+  "Return non-nil when VALUE is a supported secret reference object."
+  (and (hash-table-p value)
+       (let ((source (gethash "source" value))
+             (authinfo (gethash "authinfo" value))
+             (delivery (gethash "delivery" value "value")))
+         (and (equal source "auth-source")
+              (member delivery '("value" "command"))
+              (hash-table-p authinfo)
+              (let ((machine (gethash "machine" authinfo))
+                    (login (gethash "login" authinfo)))
+                (and (stringp machine) (not (string-empty-p machine))
+                     (stringp login) (not (string-empty-p login))))))))
+
+(defun agent-switch-validate-no-plaintext-secrets (value &optional path)
+  "Signal if JSON VALUE contains a plaintext secret.
+PATH is used internally to identify sensitive keys without exposing values."
+  (cond
+   ((hash-table-p value)
+    (maphash
+     (lambda (key child)
+       (let ((child-path (append path (list key))))
+         (when (and (stringp key)
+                    (string-match-p agent-switch--sensitive-key-regexp
+                                    (downcase key))
+                    (not (agent-switch-secret-reference-p child))
+                    (not (or (eq child agent-switch-json-null)
+                             (eq child agent-switch-json-false)
+                             (null child))))
+           (signal 'agent-switch-validation-error
+                   (list (format "Plaintext secret is not allowed at %s"
+                                 (string-join child-path ".")))))
+         (unless (agent-switch-secret-reference-p child)
+           (agent-switch-validate-no-plaintext-secrets child child-path))))
+     value))
+   ((vectorp value)
+    (dotimes (index (length value))
+      (agent-switch-validate-no-plaintext-secrets
+       (aref value index)
+       (append path (list (number-to-string index))))))
+   ((consp value)
+    (dolist (child value)
+      (agent-switch-validate-no-plaintext-secrets child path))))
+  t)
+
+(defun agent-switch-validate-profile-base (profile &optional allow-incomplete)
+  "Validate source-independent invariants for PROFILE and return it."
+  (unless (agent-switch-profile-p profile)
+    (signal 'wrong-type-argument (list 'agent-switch-profile-p profile)))
+  (agent-switch--string-id (agent-switch-profile-client-id profile) "client")
+  (agent-switch--string-id (agent-switch-profile-id profile) "profile")
+  (unless (and (stringp (agent-switch-profile-name profile))
+               (not (string-empty-p
+                     (string-trim (agent-switch-profile-name profile)))))
+    (signal 'agent-switch-validation-error '("Profile name is required")))
+  (unless (hash-table-p (agent-switch-profile-payload profile))
+    (signal 'agent-switch-validation-error
+            '("Profile payload must be a JSON object")))
+  (agent-switch-validate-no-plaintext-secrets
+   (agent-switch-profile-payload profile))
+  (when (and (agent-switch-profile-setup-required-p profile)
+             (not allow-incomplete))
+    (signal 'agent-switch-validation-error
+            '("Profile setup is incomplete; add the required secret references")))
+  profile)
+
+(defun agent-switch-normalize-capture-result (value)
+  "Return VALUE as an `agent-switch-capture-result'.
+Hash-table values remain supported as complete legacy capture results."
+  (cond
+   ((agent-switch-capture-result-p value) value)
+   ((hash-table-p value)
+    (agent-switch-capture-result-create
+     :payload value :complete-p t :warnings nil))
+   (t
+    (signal 'agent-switch-validation-error
+            '("capture-current must return a payload object or capture result")))))
+
 (defun agent-switch-adapter-callback (adapter key &optional required)
   "Return ADAPTER callback KEY.
 Signal when REQUIRED is non-nil and the callback is absent."
@@ -119,7 +211,8 @@ Signal when REQUIRED is non-nil and the callback is absent."
 Required callback properties are `:current' and `:activate'.  Optional
 callbacks are listed in `agent-switch--callback-keys'."
   (agent-switch--validate-properties
-   properties (cons :name agent-switch--callback-keys) "adapter")
+   properties (append '(:name :payload-version) agent-switch--callback-keys)
+   "adapter")
   (setq id (agent-switch--string-id id "adapter"))
   (let (callbacks)
     (dolist (key agent-switch--callback-keys)
@@ -134,13 +227,18 @@ callbacks are listed in `agent-switch--callback-keys'."
       (unless (functionp (plist-get callbacks required))
         (signal 'agent-switch-validation-error
                 (list (format "Adapter %s requires callback %s" id required)))))
-    (let ((adapter
+    (let ((payload-version (or (plist-get properties :payload-version) 1)))
+      (unless (and (integerp payload-version) (> payload-version 0))
+        (signal 'agent-switch-validation-error
+                '("Adapter payload-version must be a positive integer")))
+      (let ((adapter
            (agent-switch--make-adapter
             :id id
             :name (or (plist-get properties :name) id)
-            :callbacks callbacks)))
-      (puthash id adapter agent-switch--adapters)
-      adapter)))
+            :callbacks callbacks
+            :payload-version payload-version)))
+        (puthash id adapter agent-switch--adapters)
+        adapter))))
 
 (defmacro agent-switch-define-adapter (id &rest properties)
   "Define adapter ID declaratively with PROPERTIES."
@@ -206,7 +304,13 @@ PROPERTIES accepts `:name' and `:payload'."
                                (make-hash-table :test #'equal))
                   :ownership 'external
                   :source 'elisp
-                  :valid-p t)))
+                  :valid-p t
+                  :payload-version
+                  (agent-switch-adapter-payload-version
+                   (agent-switch-get-adapter
+                    (agent-switch-client-adapter-id
+                     (agent-switch-get-client client-id)))))))
+    (agent-switch-validate-profile-base profile)
     (puthash (cons client-id id) profile agent-switch--external-profiles)
     profile))
 
@@ -292,7 +396,7 @@ The CLIENT object is prepended to ARGUMENTS.  Return a direct value or Job."
 
 ;; Storage-owned functions are declared here to keep the activation protocol
 ;; usable without introducing a circular require.
-(declare-function agent-switch-profiles "agent-switch-storage" (client-id))
+(declare-function agent-switch-profiles "agent-switch-operations" (client-id))
 (declare-function agent-switch-resolve-profile-secrets "agent-switch-storage" (profile))
 (declare-function agent-switch-state-last-selected "agent-switch-storage" (client-id))
 (declare-function agent-switch-state-set-last-selected "agent-switch-storage"
@@ -315,10 +419,20 @@ INTERACTIVEP is recorded in the adapter context."
     (signal 'agent-switch-validation-error
             (list (or (agent-switch-profile-error profile)
                       "Profile is invalid"))))
+  (agent-switch-validate-profile-base profile)
   (unless (equal (agent-switch-client-id client)
                  (agent-switch-profile-client-id profile))
     (signal 'agent-switch-validation-error
             (list "Profile belongs to another client")))
+  (let* ((adapter (agent-switch-get-adapter
+                   (agent-switch-client-adapter-id client)))
+         (expected-version (agent-switch-adapter-payload-version adapter))
+         (actual-version (or (agent-switch-profile-payload-version profile) 1)))
+    (unless (= actual-version expected-version)
+      (signal 'agent-switch-validation-error
+              (list
+               (format "Profile payload schema version %s is not supported; expected %s"
+                       actual-version expected-version)))))
   (let* ((adapter (agent-switch-get-adapter
                    (agent-switch-client-adapter-id client)))
          (validate (agent-switch-adapter-callback adapter :validate))

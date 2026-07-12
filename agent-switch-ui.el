@@ -16,6 +16,7 @@
 (require 'transient)
 (require 'agent-switch-core)
 (require 'agent-switch-storage)
+(require 'agent-switch-operations)
 
 (declare-function evil-define-key* "evil-core")
 (declare-function evil-insert-state "evil-commands")
@@ -32,6 +33,21 @@
   :type 'number
   :group 'agent-switch)
 
+(defconst agent-switch-profile-name-column-width 28
+  "Maximum display width of the Profile name column.")
+
+(defconst agent-switch-profile-id-column-width 20
+  "Maximum display width of the Profile ID column.")
+
+(defconst agent-switch-profile-model-column-width 32
+  "Maximum display width of the Profile model column.")
+
+(defconst agent-switch-profile-base-url-column-width 42
+  "Maximum display width of the Profile provider Base URL column.")
+
+(defconst agent-switch-profile-missing-value "-"
+  "Placeholder displayed for a missing Profile column value.")
+
 (defface agent-switch-section-heading
   '((t :inherit bold))
   "Section heading face."
@@ -47,24 +63,19 @@
   "Current Profile face."
   :group 'agent-switch)
 
+(defface agent-switch-action-required
+  '((t :inherit error :weight bold))
+  "Face for incomplete Profiles requiring user action."
+  :group 'agent-switch)
+
 (defface agent-switch-status-success
   '((t :inherit success))
   "Successful status face."
   :group 'agent-switch)
 
-(defface agent-switch-status-warning
-  '((t :inherit warning))
-  "Warning status face."
-  :group 'agent-switch)
-
 (defface agent-switch-status-error
   '((t :inherit error))
   "Error status face."
-  :group 'agent-switch)
-
-(defface agent-switch-tag
-  '((t :inherit font-lock-constant-face))
-  "Profile tag face."
   :group 'agent-switch)
 
 (defface agent-switch-key
@@ -78,15 +89,13 @@
 
 (cl-defstruct (agent-switch-client-view
                (:constructor agent-switch--make-client-view))
-  client profiles current current-profile last-selected error loading-p)
+  client profiles current-profile error)
 
 (defvar-local agent-switch--sections nil)
 (defvar-local agent-switch--visibility nil)
 (defvar-local agent-switch--generation 0)
 (defvar-local agent-switch--current-cache nil)
-(defvar agent-switch--running-jobs (make-hash-table :test #'equal)
-  "Mutating Client Jobs shared by all agent-switch UI buffers.")
-
+(defvar-local agent-switch--owned-jobs nil)
 (defvar-local agent-switch--watch-descriptors nil)
 (defvar-local agent-switch--watch-cleanups nil)
 (defvar-local agent-switch--watch-timer nil)
@@ -153,16 +162,6 @@ context, and FACE overrides the standard heading face."
                       plain))
          (padding (max 0 (- width (string-width truncated)))))
     (concat truncated (make-string padding ?\s))))
-
-(defun agent-switch--profile-status-tag (profile current-p)
-  "Return status tag for PROFILE and CURRENT-P."
-  (cond
-   ((not (agent-switch-profile-valid-p profile))
-    (propertize "invalid" 'face 'agent-switch-status-error))
-   (current-p (propertize "current" 'face 'agent-switch-status-success))
-   ((eq (agent-switch-profile-ownership profile) 'external)
-    (propertize "external" 'face 'agent-switch-tag))
-   (t (propertize "managed" 'face 'agent-switch-tag))))
 
 (defun agent-switch--current-cache-entry (client-id)
   "Return current-state cache entry for CLIENT-ID."
@@ -251,6 +250,10 @@ Prefer the Profile named by LAST-SELECTED."
          (last-selected (condition-case nil
                             (agent-switch-state-last-selected client-id)
                           (error nil)))
+         (initialized-p
+          (condition-case nil
+              (agent-switch-state-client-initialized-p client-id)
+            (error nil)))
          (profiles nil)
          (profile-error nil)
          (current-result (agent-switch--client-current client))
@@ -273,72 +276,28 @@ Prefer the Profile named by LAST-SELECTED."
         (error
          (setq profile-error
                (agent-switch--safe-error-message error-value)))))
+    (when (and (not initialized-p)
+               (null profile-error)
+               (not (memq (agent-switch-profile-discovery-status client-id)
+                          '(pending error))))
+      (condition-case error-value
+          (if profiles
+              (agent-switch-state-finish-client-initialization client-id)
+            (when (and current (null current-error) (not loading-p))
+              (when-let* ((profile
+                           (agent-switch-bootstrap-client client current)))
+                (setq profiles (list profile)
+                      last-selected
+                      (agent-switch-state-last-selected client-id)))))
+        (error
+         (setq profile-error
+               (agent-switch--safe-error-message error-value)))))
     (agent-switch--make-client-view
      :client client
      :profiles profiles
-     :current current
      :current-profile (agent-switch--matching-profile
                        client profiles current last-selected)
-     :last-selected last-selected
-     :error (or current-error profile-error)
-     :loading-p loading-p)))
-
-(defun agent-switch--client-status (view)
-  "Return propertized status string for client VIEW."
-  (let* ((client (agent-switch-client-view-client view))
-         (client-id (agent-switch-client-id client))
-         (current (agent-switch-client-view-current view))
-         (current-profile (agent-switch-client-view-current-profile view))
-         (last-selected (agent-switch-client-view-last-selected view))
-         (last-profile
-          (and last-selected
-               (cl-find last-selected (agent-switch-client-view-profiles view)
-                        :key #'agent-switch-profile-id :test #'equal)))
-         (applied (agent-switch-state-applied-profile client-id))
-         (applied-payload
-          (and (hash-table-p applied) (gethash "payload" applied)))
-         (profile-changed
-          (and last-profile (hash-table-p applied-payload)
-               (not (agent-switch--json-value-equal-p
-                     (agent-switch-profile-payload last-profile)
-                     applied-payload))))
-         (live-matches-applied
-          (and current last-profile (hash-table-p applied-payload)
-               (let ((snapshot (copy-agent-switch-profile last-profile)))
-                 (setf (agent-switch-profile-payload snapshot) applied-payload)
-                 (condition-case nil
-                     (agent-switch-profile-current-p
-                      client snapshot current nil)
-                   (error nil))))))
-    (cond
-     ((agent-switch--job-running-p client-id)
-      (propertize "working" 'face 'agent-switch-status-warning))
-     ((agent-switch-client-view-loading-p view)
-      (propertize "loading" 'face 'shadow))
-     ((agent-switch-client-view-error view)
-      (propertize "error" 'face 'agent-switch-status-error))
-     ((and last-profile (not (agent-switch-profile-valid-p last-profile)))
-      (concat (propertize "invalid profile, " 'face 'agent-switch-status-error)
-              (agent-switch-profile-name last-profile)))
-     ((and current-profile
-           (equal (agent-switch-profile-id current-profile) last-selected))
-      (concat "current, "
-              (propertize (agent-switch-profile-name current-profile)
-                          'face 'agent-switch-current)))
-     (current-profile
-      (concat (propertize "external selection, "
-                          'face 'agent-switch-status-warning)
-              (agent-switch-profile-name current-profile)))
-     ((and profile-changed live-matches-applied)
-      (concat (propertize "apply pending, "
-                          'face 'agent-switch-status-warning)
-              (agent-switch-profile-name last-profile)))
-     (profile-changed
-      (concat (propertize "conflict, " 'face 'agent-switch-status-error)
-              (agent-switch-profile-name last-profile)))
-     (current
-      (propertize "unmanaged live config" 'face 'agent-switch-status-warning))
-     (t (propertize "not configured" 'face 'shadow)))))
+     :error (or current-error profile-error))))
 
 (defun agent-switch--insert-status-line (key value &optional value-face)
   "Insert a top-level status line containing KEY and VALUE using VALUE-FACE."
@@ -362,6 +321,75 @@ Prefer the Profile named by LAST-SELECTED."
       (agent-switch--insert-status-line
        "Error" state-error 'agent-switch-status-error))))
 
+(defun agent-switch--profile-column-value (value)
+  "Return VALUE as a displayable Profile column or the missing placeholder."
+  (if (and (stringp value) (not (string-empty-p value)))
+      value
+    agent-switch-profile-missing-value))
+
+(defun agent-switch--profile-columns (client profile)
+  "Return secret-safe model and Base URL columns for CLIENT PROFILE."
+  (let* ((adapter (agent-switch-get-adapter
+                   (agent-switch-client-adapter-id client)))
+         (callback (agent-switch-adapter-callback adapter :profile-columns)))
+    (if (and callback (agent-switch-profile-valid-p profile))
+        (condition-case nil
+            (let ((value (funcall callback client profile nil)))
+              (list :model
+                    (agent-switch--profile-column-value
+                     (plist-get value :model))
+                    :base-url
+                    (agent-switch--profile-column-value
+                     (plist-get value :base-url))))
+          (error (list :model agent-switch-profile-missing-value
+                       :base-url agent-switch-profile-missing-value)))
+      (list :model agent-switch-profile-missing-value
+            :base-url agent-switch-profile-missing-value))))
+
+(defun agent-switch--profile-action-required-p (profile)
+  "Return non-nil when PROFILE needs setup before it can be applied."
+  (or (agent-switch-profile-setup-required-p profile)
+      (and (agent-switch-profile-valid-p profile)
+           (or (not (agent-switch--secret-references-available-p
+                     (agent-switch-profile-payload profile)))
+               (condition-case nil
+                   (let* ((client
+                           (agent-switch-get-client
+                            (agent-switch-profile-client-id profile)))
+                          (adapter
+                           (agent-switch-get-adapter
+                            (agent-switch-client-adapter-id client)))
+                          (expected-version
+                           (agent-switch-adapter-payload-version adapter))
+                          (actual-version
+                           (or (agent-switch-profile-payload-version profile) 1))
+                          (validate
+                           (agent-switch-adapter-callback adapter :validate)))
+                     (or (/= actual-version expected-version)
+                         (and validate
+                              (not (funcall validate client profile nil)))))
+                 (error t))))))
+
+(defun agent-switch--profile-name-cell (profile)
+  "Return bounded name column for PROFILE with any required-action marker."
+  (if (not (agent-switch--profile-action-required-p profile))
+      (agent-switch--display-width
+       (agent-switch-profile-name profile)
+       agent-switch-profile-name-column-width)
+    (let* ((action-text " (action required)")
+           (name-width (- agent-switch-profile-name-column-width
+                          (string-width action-text)))
+           (profile-name (agent-switch-profile-name profile))
+           (truncated-name
+            (if (> (string-width profile-name) name-width)
+                (truncate-string-to-width
+                 profile-name name-width nil nil "...")
+              profile-name)))
+      (agent-switch--display-width
+       (concat truncated-name
+               (propertize action-text 'face 'agent-switch-action-required))
+       agent-switch-profile-name-column-width))))
+
 (defun agent-switch--insert-profile-section (view profile)
   "Insert PROFILE section for client VIEW."
   (let* ((client-id (agent-switch-client-id
@@ -370,12 +398,22 @@ Prefer the Profile named by LAST-SELECTED."
                                        "profile" (agent-switch-profile-id profile)))
          (current-p (eq profile (agent-switch-client-view-current-profile view)))
          (marker (if current-p "  *" "   "))
-         (name (agent-switch--display-width
-                (agent-switch-profile-name profile) 28))
+         (columns (agent-switch--profile-columns
+                   (agent-switch-client-view-client view) profile))
+         (name (agent-switch--profile-name-cell profile))
          (profile-id (agent-switch--display-width
-                      (agent-switch-profile-id profile) 22))
-         (label (concat marker " " name " " profile-id " "
-                        (agent-switch--profile-status-tag profile current-p)))
+                      (agent-switch-profile-id profile)
+                      agent-switch-profile-id-column-width))
+         (model (agent-switch--display-width
+                 (plist-get columns :model)
+                 agent-switch-profile-model-column-width))
+         (base-url (agent-switch--display-width
+                    (plist-get columns :base-url)
+                    agent-switch-profile-base-url-column-width))
+         (label (string-trim-right
+                 (string-join
+                  (list (concat marker " " name) profile-id model base-url)
+                  " ")))
          (section
           (agent-switch--insert-section-heading
            id 'profile label profile
@@ -390,9 +428,8 @@ Prefer the Profile named by LAST-SELECTED."
          (id (agent-switch--section-id "client" client-id))
          (name (propertize (agent-switch-client-name client)
                            'face 'agent-switch-key))
-         (label (concat name " (" (agent-switch--client-status view) ")"))
          (section (agent-switch--insert-section-heading
-                   id 'client label client 'default)))
+                   id 'client name client 'default)))
     (when (agent-switch-section-expanded-p section)
       (when-let* ((error-text (agent-switch-client-view-error view)))
         (agent-switch--insert-detail-line
@@ -558,15 +595,12 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
       (agent-switch-profile-edit)
     (agent-switch-toggle-section)))
 
-(defun agent-switch--job-running-p (client-id)
-  "Return non-nil when CLIENT-ID has a running activation."
-  (gethash client-id agent-switch--running-jobs))
-
 (defun agent-switch--ensure-client-idle (client)
   "Signal when CLIENT already has a mutating operation in progress."
-  (when (agent-switch--job-running-p (agent-switch-client-id client))
-    (user-error "%s already has an operation in progress"
-                (agent-switch-client-name client))))
+  (condition-case error-value
+      (agent-switch-ensure-client-idle client)
+    (agent-switch-error
+     (user-error "%s" (agent-switch--safe-error-message error-value)))))
 
 (defun agent-switch--activate-profile (client profile)
   "Activate CLIENT PROFILE transactionally from the dashboard."
@@ -588,16 +622,16 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
                         (agent-switch-adapter-id adapter))
                        t)))
       (user-error "Cancelled"))
-    (let ((job (agent-switch-activation-job client profile t))
+    (let ((job (agent-switch-apply-profile client profile t))
           (buffer (current-buffer)))
-      (puthash client-id job agent-switch--running-jobs)
+      (puthash client-id job agent-switch--owned-jobs)
       (agent-switch-refresh t)
       (agent-switch-job-start
        job
        (lambda (_value)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (remhash client-id agent-switch--running-jobs)))
+             (remhash client-id agent-switch--owned-jobs)))
          (agent-switch-refresh-dashboards)
          (message "Activated %s for %s"
                   (agent-switch-profile-name profile)
@@ -606,7 +640,7 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
          (let ((message-text (agent-switch--safe-error-message error-value)))
            (when (buffer-live-p buffer)
              (with-current-buffer buffer
-               (remhash client-id agent-switch--running-jobs)
+               (remhash client-id agent-switch--owned-jobs)
                (agent-switch-refresh t)))
            (message "agent-switch: %s" message-text)))))))
 
@@ -617,23 +651,6 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
          (client (agent-switch-get-client
                   (agent-switch-profile-client-id profile))))
     (agent-switch--activate-profile client profile)))
-
-(defun agent-switch--random-profile-id (client-id)
-  "Return an unused short random Profile ID for CLIENT-ID."
-  (let (candidate)
-    (while
-        (progn
-          (setq candidate
-                (concat
-                 "p-"
-                 (substring
-                  (secure-hash
-                   'sha256
-                   (format "%s:%s:%s:%s"
-                           client-id (float-time) (random) (emacs-pid)))
-                  0 8)))
-          (file-exists-p (agent-switch-profile-path client-id candidate))))
-    candidate))
 
 (defun agent-switch--read-profile-name (&optional default)
   "Read a non-empty Profile name, using DEFAULT when supplied."
@@ -656,15 +673,11 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
               '("profile-template must return a JSON object")))
     (agent-switch-json-copy payload)))
 
-(defun agent-switch--save-new-profile (client name payload)
+(defun agent-switch--save-new-profile
+    (client name payload &optional setup-required-p warnings)
   "Create, save, and visit a managed Profile for CLIENT."
-  (let* ((client-id (agent-switch-client-id client))
-         (id (agent-switch--random-profile-id client-id))
-         (profile (agent-switch--make-profile
-                   :id id :client-id client-id :name name
-                   :payload payload
-                   :ownership 'managed :valid-p t)))
-    (agent-switch-save-profile profile)
+  (let ((profile (agent-switch-create-managed-profile
+                  client name payload setup-required-p warnings)))
     (agent-switch-refresh-dashboards)
     (find-file (agent-switch-profile-source profile))
     profile))
@@ -697,6 +710,50 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
       (user-error "Profile has no managed source file"))
     (find-file source)))
 
+(defun agent-switch--visit-adopted-profile (profile)
+  "Refresh dashboards and visit adopted PROFILE."
+  (agent-switch-refresh-dashboards)
+  (find-file (agent-switch-profile-source profile))
+  profile)
+
+(defun agent-switch-adopt-current-at-point ()
+  "Adopt current Client state as the selected managed Profile."
+  (interactive)
+  (let* ((client (agent-switch--client-at-point))
+         (current-result (agent-switch--client-current client))
+         (current (nth 0 current-result))
+         (error-text (nth 1 current-result))
+         (loading-p (nth 2 current-result)))
+    (agent-switch--ensure-client-idle client)
+    (when loading-p
+      (user-error "Current state is still loading"))
+    (when error-text
+      (user-error "%s" error-text))
+    (unless current
+      (user-error "Client has no current configuration to adopt"))
+    (let ((result
+           (condition-case error-value
+               (agent-switch-adopt-current
+                client
+                (agent-switch--read-profile-name
+                 (format "Adopted %s" (agent-switch-client-name client)))
+                current)
+             (agent-switch-error
+              (user-error "%s"
+                          (agent-switch--safe-error-message error-value)))))
+          (buffer (current-buffer)))
+      (if (agent-switch-job-p result)
+          (agent-switch-job-start
+           result
+           (lambda (profile)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (agent-switch--visit-adopted-profile profile))))
+           (lambda (error-value)
+             (message "agent-switch: %s"
+                      (agent-switch--safe-error-message error-value))))
+        (agent-switch--visit-adopted-profile result)))))
+
 (defun agent-switch-profile-copy ()
   "Copy the Profile at point to a new managed Profile and visit it."
   (interactive)
@@ -712,52 +769,41 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
      (agent-switch-json-copy (agent-switch-profile-payload profile)))))
 
 (defun agent-switch-profile-delete ()
-  "Delete the inactive managed Profile at point."
+  "Delete the managed Profile at point."
   (interactive)
   (let* ((profile (agent-switch--profile-at-point))
          (client-id (agent-switch-profile-client-id profile))
          (client (agent-switch-get-client client-id))
-         (current-result (agent-switch--client-current client))
-         (current (nth 0 current-result))
-         (current-p
-          (and current
-               (condition-case nil
-                   (agent-switch-profile-current-p client profile current nil)
-                 (error nil))))
-         (last-selected (agent-switch-state-last-selected client-id))
          (source (agent-switch-profile-source profile))
          (visiting (and (stringp source) (find-buffer-visiting source))))
     (agent-switch--ensure-client-idle client)
     (unless (eq (agent-switch-profile-ownership profile) 'managed)
       (user-error "Read-only Profiles cannot be deleted"))
-    (when (or current-p
-              (equal (agent-switch-profile-id profile) last-selected))
-      (user-error "Current Profile cannot be deleted; Apply another Profile first"))
     (when (and visiting (buffer-modified-p visiting))
       (user-error "Profile has unsaved changes in %s" (buffer-name visiting)))
     (unless (yes-or-no-p
              (format "Delete managed Profile %s? "
                      (agent-switch-profile-name profile)))
       (user-error "Cancelled"))
-    (agent-switch-delete-profile profile)
+    (agent-switch-delete-managed-profile profile)
     (agent-switch-refresh-dashboards)))
 
 (defun agent-switch-diagnose ()
   "Display sanitized agent-switch diagnostics."
   (interactive)
-  (let ((lines
-         (list
-          (format "Data directory: %s" (agent-switch--directory))
-          (format "State file: %s" (agent-switch-state-path))
-          (format "State status: %s"
-                  (or (agent-switch-state-record-error (agent-switch-read-state))
-                      "ok"))
-          (format "Registered clients: %s"
-                  (string-join (mapcar #'agent-switch-client-id
-                                       (agent-switch-clients)) ", "))
-          (format "toml available: %s" (if (locate-library "toml") "yes" "no"))
-          (format "tomelr available: %s" (if (locate-library "tomelr") "yes" "no"))
-          (format "gptel available: %s" (if (locate-library "gptel") "yes" "no")))))
+  (let* ((data (agent-switch-diagnostics-data))
+         (lines
+          (list
+           (format "Data directory: %s" (gethash "data_directory" data))
+           (format "State file: %s" (gethash "state_file" data))
+           (format "State status: %s" (gethash "state_status" data))
+           (format "Registered clients: %s"
+                   (string-join
+                    (append (gethash "registered_clients" data) nil) ", "))
+           (format "toml available: %s"
+                   (if (gethash "toml_available" data) "yes" "no"))
+           (format "tomelr available: %s"
+                   (if (gethash "tomelr_available" data) "yes" "no")))))
     (with-current-buffer (get-buffer-create "*agent-switch diagnose*")
       (let ((inhibit-read-only t))
         (erase-buffer)
@@ -769,9 +815,9 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
   "Open the agent-switch action menu."
   [["Profile"
     ("a" "Apply" agent-switch-activate-at-point)
+    ("A" "Adopt" agent-switch-adopt-current-at-point)
     ("n" "New" agent-switch-profile-new)
     ("c" "Copy" agent-switch-profile-copy)
-    ("e" "Edit" agent-switch-profile-edit)
     ("D" "Delete" agent-switch-profile-delete)]
    ["View"
     ("g" "Refresh" agent-switch-refresh)
@@ -871,7 +917,7 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
     (cancel-timer agent-switch--watch-timer))
   (maphash (lambda (_client-id job)
              (agent-switch-job-cancel job))
-           agent-switch--running-jobs)
+           agent-switch--owned-jobs)
   (maphash (lambda (_client-id entry)
              (when-let* ((job (and (eq (plist-get entry :status) 'pending)
                                     (plist-get entry :job))))
@@ -887,6 +933,7 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
   (setq-local agent-switch--sections (make-hash-table :test #'equal))
   (setq-local agent-switch--visibility (make-hash-table :test #'equal))
   (setq-local agent-switch--current-cache (make-hash-table :test #'equal))
+  (setq-local agent-switch--owned-jobs (make-hash-table :test #'equal))
   (setq-local revert-buffer-function
               (lambda (&rest _ignore) (agent-switch-refresh)))
   (add-hook 'kill-buffer-hook #'agent-switch--cleanup nil t)

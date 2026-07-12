@@ -3,13 +3,13 @@ EMACS_BATCH = $(EMACS) -Q --batch \
 	--eval "(setq load-prefer-newer t)" \
 	--eval "(require 'package)" \
 	--eval "(package-initialize t)" \
-	--eval "(dolist (pkg '(transient toml tomelr gptel)) (package-activate pkg))"
+	--eval "(dolist (pkg '(transient toml tomelr)) (package-activate pkg))"
 
 LOADPATH = -L .
 
 BYTE_COMPILE_FLAGS = --eval "(setq byte-compile-error-on-warn nil)"
 
-SRCS = agent-switch-core.el agent-switch-storage.el agent-switch-adapters.el agent-switch-ui.el agent-switch.el
+SRCS = agent-switch-authinfo.el agent-switch-core.el agent-switch-storage.el agent-switch-adapters.el agent-switch-operations.el agent-switch-ui.el agent-switch.el
 COMPILED = $(SRCS:.el=.elc)
 
 .PHONY: all compile clean test test-unit help

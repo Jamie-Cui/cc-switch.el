@@ -5,19 +5,17 @@
 
 ;;; Commentary:
 
-;; Built-in Claude Code, Codex, gptel Default, and OpenCode Global Adapters.
+;; Built-in Claude Code, Codex, and OpenCode Adapters.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'diff)
 (require 'subr-x)
+(require 'url-parse)
 (require 'agent-switch-core)
 (require 'agent-switch-storage)
 
-(declare-function gptel-backend-models "gptel-request")
-(declare-function gptel-backend-name "gptel-request")
-(declare-function gptel-get-backend "gptel-request")
 (declare-function tomelr-encode "tomelr")
 (declare-function toml:read-from-string "toml")
 
@@ -162,13 +160,115 @@ opencode.json below XDG_CONFIG_HOME or ~/.config."
             value))
    (t value)))
 
+(defun agent-switch--provider-base-url-key-p (key)
+  "Return non-nil when KEY conventionally names a provider Base URL."
+  (and (stringp key)
+       (let ((normalized (downcase key)))
+         (or (string-suffix-p "base_url" normalized)
+             (string-suffix-p "baseurl" normalized)))))
+
+(defun agent-switch--find-provider-base-url (value)
+  "Return the first provider Base URL string found recursively in VALUE."
+  (cond
+   ((hash-table-p value)
+    (let (found)
+      (maphash
+       (lambda (key child)
+         (unless found
+           (setq found
+                 (if (and (agent-switch--provider-base-url-key-p key)
+                          (stringp child)
+                          (not (string-empty-p child)))
+                     child
+                   (agent-switch--find-provider-base-url child)))))
+       value)
+      found))
+   ((vectorp value)
+    (cl-loop for child across value
+             thereis (agent-switch--find-provider-base-url child)))
+   ((consp value)
+    (cl-loop for child in value
+             thereis (agent-switch--find-provider-base-url child)))
+   (t nil)))
+
+(defun agent-switch--capture-authinfo-machine (client current)
+  "Return authinfo machine for CLIENT CURRENT provider state."
+  (let* ((base-url (agent-switch--find-provider-base-url current))
+         (machine (and base-url
+                       (condition-case nil
+                           (url-host (url-generic-parse-url base-url))
+                         (error nil)))))
+    (if (and (stringp machine) (not (string-empty-p machine)))
+        machine
+      (if (agent-switch-client-p client)
+          (agent-switch-client-id client)
+        "agent-switch"))))
+
+(defun agent-switch--auth-source-reference (machine login &optional delivery)
+  "Return an auth-source reference for MACHINE, LOGIN, and DELIVERY."
+  (let ((reference (make-hash-table :test #'equal))
+        (authinfo (make-hash-table :test #'equal)))
+    (puthash "source" "auth-source" reference)
+    (puthash "machine" machine authinfo)
+    (puthash "login" login authinfo)
+    (puthash "authinfo" authinfo reference)
+    (when delivery (puthash "delivery" delivery reference))
+    reference))
+
+(defun agent-switch--captured-secret-reference (machine path)
+  "Return an auth-source reference for authinfo MACHINE and secret PATH."
+  (agent-switch--auth-source-reference
+   machine (if path (string-join path ".") "secret")))
+
+(defun agent-switch--capture-secret-safe-value (value machine &optional path)
+  "Copy VALUE, replacing secret markers with authinfo MACHINE references."
+  (cond
+   ((agent-switch--secret-marker-p value)
+    (agent-switch--captured-secret-reference machine path))
+   ((hash-table-p value)
+    (let ((copy (make-hash-table :test #'equal)))
+      (maphash
+       (lambda (key child)
+         (puthash
+          key
+          (agent-switch--capture-secret-safe-value
+           child machine (append path (list (format "%s" key))))
+          copy))
+       value)
+      copy))
+   ((vectorp value)
+    (let ((copy (make-vector (length value) nil)))
+      (dotimes (index (length value))
+        (aset copy index
+              (agent-switch--capture-secret-safe-value
+               (aref value index) machine
+               (append path (list (number-to-string index))))))
+      copy))
+   ((consp value)
+    (cl-loop for child in value
+             for index from 0
+             collect (agent-switch--capture-secret-safe-value
+                      child machine
+                      (append path (list (number-to-string index))))))
+   (t value)))
+
+(defun agent-switch--capture-current (client current _context)
+  "Capture CURRENT with generated auth-source references for all secrets."
+  (let ((machine (agent-switch--capture-authinfo-machine client current)))
+    (agent-switch-capture-result-create
+     :payload (agent-switch--capture-secret-safe-value current machine)
+     :complete-p t
+     :warnings nil)))
+
 (defun agent-switch--json-subset-p (expected actual)
   "Return non-nil when JSON EXPECTED is represented by ACTUAL.
 Secret references match any configured secret; resolved strings match hashed
 secret markers exactly."
   (cond
    ((agent-switch-secret-reference-p expected)
-    (agent-switch--secret-marker-p actual))
+    (or (agent-switch--secret-marker-p actual)
+        (and (agent-switch-secret-reference-p actual)
+             (agent-switch--json-value-equal-p expected actual))))
    ((agent-switch--secret-marker-p actual)
     (and (stringp expected)
          (equal (gethash "$secret_hash" actual)
@@ -192,6 +292,23 @@ secret markers exactly."
                   always (agent-switch--json-subset-p
                           (aref expected index) (aref actual index)))))
    (t (equal expected actual))))
+
+(defun agent-switch--json-object-exact-p (expected actual)
+  "Return non-nil when JSON objects EXPECTED and ACTUAL match exactly.
+Secret references in EXPECTED match redacted markers in ACTUAL."
+  (and (hash-table-p expected)
+       (hash-table-p actual)
+       (= (hash-table-count expected) (hash-table-count actual))
+       (agent-switch--json-subset-p expected actual)))
+
+(defun agent-switch--optional-field-match-p (key expected actual)
+  "Return non-nil when optional KEY has equal presence and value."
+  (let ((missing (make-symbol "missing")))
+    (let ((expected-value (gethash key expected missing))
+          (actual-value (gethash key actual missing)))
+      (and (eq (eq expected-value missing) (eq actual-value missing))
+           (or (eq expected-value missing)
+               (agent-switch--json-subset-p expected-value actual-value))))))
 
 ;;; Claude Code
 
@@ -262,7 +379,9 @@ Return nil when no ANTHROPIC_* keys are configured."
 
 (defun agent-switch--claude-profile-current-p (_client profile current _context)
   "Return non-nil when Claude PROFILE matches CURRENT state."
-  (agent-switch--json-subset-p (agent-switch-profile-payload profile) current))
+  (let ((expected-env (gethash "env" (agent-switch-profile-payload profile)))
+        (actual-env (and (hash-table-p current) (gethash "env" current))))
+    (agent-switch--json-object-exact-p expected-env actual-env)))
 
 (defun agent-switch--claude-watch-paths (_client _context)
   "Return paths watched for Claude changes."
@@ -381,13 +500,117 @@ Return nil when no ANTHROPIC_* keys are configured."
         (or (agent-switch--alist-get provider-id providers) nil)
       nil)))
 
+(defconst agent-switch--codex-managed-openai-provider-id
+  "agent-switch-openai"
+  "Live Codex provider ID used for authinfo-managed OpenAI access.")
+
+(defun agent-switch--codex-semantic-provider-id (live-provider-id)
+  "Return Profile provider ID represented by LIVE-PROVIDER-ID."
+  (if (equal live-provider-id agent-switch--codex-managed-openai-provider-id)
+      "openai"
+    live-provider-id))
+
+(defun agent-switch--codex-live-provider-id (provider-id credential)
+  "Return live provider ID for Profile PROVIDER-ID and CREDENTIAL."
+  (if (and credential (equal provider-id "openai"))
+      agent-switch--codex-managed-openai-provider-id
+    provider-id))
+
+(defun agent-switch--codex-openai-provider-defaults (provider)
+  "Return PROVIDER with authinfo-managed OpenAI defaults."
+  (let ((copy (agent-switch-json-copy provider)))
+    (unless (gethash "name" copy)
+      (puthash "name" "OpenAI (authinfo)" copy))
+    (unless (gethash "base_url" copy)
+      (puthash "base_url" "https://api.openai.com/v1" copy))
+    (unless (gethash "wire_api" copy)
+      (puthash "wire_api" "responses" copy))
+    copy))
+
+(defun agent-switch--codex-credential-reference (provider-id provider)
+  "Return a command-delivered authinfo reference for PROVIDER-ID PROVIDER."
+  (agent-switch--auth-source-reference
+   (or (and (hash-table-p provider)
+            (let ((base-url (agent-switch--find-provider-base-url provider)))
+              (and base-url
+                   (condition-case nil
+                       (url-host (url-generic-parse-url base-url))
+                     (error nil)))))
+       provider-id)
+   (format "codex.%s.api-key" provider-id)
+   "command"))
+
+(defun agent-switch--codex-auth-helper-command ()
+  "Return the Emacs executable used for Codex command-backed auth."
+  (expand-file-name invocation-name invocation-directory))
+
+(defun agent-switch--codex-auth-helper-args (credential)
+  "Return command arguments that resolve CREDENTIAL through authinfo."
+  (let* ((authinfo (gethash "authinfo" credential))
+         (machine (gethash "machine" authinfo))
+         (login (gethash "login" authinfo))
+         (library (or (locate-library "agent-switch-authinfo")
+                      (signal 'agent-switch-error
+                              '("agent-switch-authinfo library is unavailable"))))
+         (directory (file-name-directory library)))
+    (vconcat
+     (list "-Q" "--batch" "-L" directory
+           "-l" "agent-switch-authinfo"
+           "--eval" "(agent-switch-authinfo-main)"
+           "--" (expand-file-name agent-switch-authinfo-file)
+           machine login))))
+
+(defun agent-switch--codex-auth-table (credential)
+  "Return a Codex command-backed auth table for CREDENTIAL."
+  (let ((auth (make-hash-table :test #'equal)))
+    (puthash "command" (agent-switch--codex-auth-helper-command) auth)
+    (puthash "args" (agent-switch--codex-auth-helper-args credential) auth)
+    (puthash "timeout_ms" 15000 auth)
+    (puthash "refresh_interval_ms" 300000 auth)
+    auth))
+
+(defun agent-switch--codex-helper-auth-reference (auth)
+  "Return the authinfo reference encoded by managed Codex AUTH, or nil."
+  (when (hash-table-p auth)
+    (let* ((args-value (gethash "args" auth))
+           (args (cond ((vectorp args-value) (append args-value nil))
+                       ((listp args-value) args-value)))
+           (separator (and args (cl-position "--" args :test #'equal)))
+           (tail (and separator (nthcdr (1+ separator) args))))
+      (when (and (member "agent-switch-authinfo" args)
+                 (member "(agent-switch-authinfo-main)" args)
+                 (= (length tail) 3)
+                 (equal (expand-file-name (nth 0 tail))
+                        (expand-file-name agent-switch-authinfo-file)))
+        (agent-switch--auth-source-reference
+         (nth 1 tail) (nth 2 tail) "command")))))
+
+(defun agent-switch--codex-normalize-provider-auth (provider-id provider)
+  "Return (PROVIDER . CREDENTIAL) for live PROVIDER-ID PROVIDER state."
+  (let* ((copy (agent-switch-json-copy provider))
+         (credential
+          (and (hash-table-p copy)
+               (agent-switch--codex-helper-auth-reference
+                (gethash "auth" copy)))))
+    (when credential
+      (remhash "auth" copy))
+    (when (and (not credential) (hash-table-p copy) (gethash "env_key" copy))
+      (setq credential
+            (agent-switch--codex-credential-reference provider-id copy))
+      (remhash "env_key" copy)
+      (remhash "env_key_instructions" copy))
+    (cons copy credential)))
+
 (defun agent-switch--codex-current (_client _context)
   "Return current Codex provider-owned state.
 Return nil when no provider is configured."
   (let* ((config (agent-switch--read-toml-file
                   (agent-switch--codex-config-path)))
-         (provider-id (agent-switch--alist-get "model_provider" config)))
-    (when provider-id
+         (live-provider-id (agent-switch--alist-get "model_provider" config))
+         (provider-id (and live-provider-id
+                           (agent-switch--codex-semantic-provider-id
+                            live-provider-id))))
+    (when live-provider-id
       (let ((payload (make-hash-table :test #'equal)))
         (puthash "provider-id" provider-id payload)
         (when-let* ((model (agent-switch--alist-get "model" config)))
@@ -395,13 +618,28 @@ Return nil when no provider is configured."
         (when-let* ((small (agent-switch--alist-get "small_model" config)))
           (puthash "small-model" small payload))
         (let ((provider-state
-               (agent-switch--codex-provider-state config provider-id)))
-          (puthash "provider"
-                   (if provider-state
-                       (agent-switch--redact-json-secrets
-                        (agent-switch--toml-to-json provider-state))
-                     (make-hash-table :test #'equal))
-                   payload))
+               (agent-switch--codex-provider-state config live-provider-id)))
+          (pcase-let* ((provider
+                        (if provider-state
+                            (agent-switch--redact-json-secrets
+                             (agent-switch--toml-to-json provider-state))
+                          (make-hash-table :test #'equal)))
+                       (provider
+                        (if (equal provider-id "openai")
+                            (agent-switch--codex-openai-provider-defaults
+                             provider)
+                          provider))
+                       (`(,normalized . ,credential)
+                        (agent-switch--codex-normalize-provider-auth
+                         provider-id provider)))
+            (unless (or credential
+                        (member provider-id '("ollama" "lmstudio")))
+              (setq credential
+                    (agent-switch--codex-credential-reference
+                     provider-id normalized)))
+            (puthash "provider" normalized payload)
+            (when credential
+              (puthash "credential" credential payload))))
         payload))))
 
 (defun agent-switch--codex-validate (_client profile _context)
@@ -409,7 +647,8 @@ Return nil when no provider is configured."
   (let* ((payload (agent-switch-profile-payload profile))
          (provider-id (gethash "provider-id" payload))
          (model (gethash "model" payload))
-         (provider (gethash "provider" payload)))
+         (provider (gethash "provider" payload))
+         (credential (gethash "credential" payload)))
     (unless (and (stringp provider-id) (not (string-empty-p provider-id)))
       (signal 'agent-switch-validation-error
               '("Codex provider-id is required")))
@@ -418,6 +657,19 @@ Return nil when no provider is configured."
     (unless (or (null provider) (hash-table-p provider))
       (signal 'agent-switch-validation-error
               '("Codex provider patch must be an object")))
+    (when (hash-table-p provider)
+      (dolist (key '("env_key" "env_key_instructions" "env_http_headers"
+                     "experimental_bearer_token" "requires_openai_auth"
+                     "auth"))
+        (when (gethash key provider)
+          (signal 'agent-switch-validation-error
+                  (list (format "Codex Profile cannot persist provider.%s; use credential authinfo"
+                                key))))))
+    (unless (or (member provider-id '("ollama" "lmstudio"))
+                (and (agent-switch-secret-reference-p credential)
+                     (equal (gethash "delivery" credential) "command")))
+      (signal 'agent-switch-validation-error
+              '("Codex credential must be a command-delivered authinfo reference")))
     t))
 
 (defun agent-switch--codex-snapshot (_client _profile _context)
@@ -466,17 +718,27 @@ CONTEXT determines whether an interactive confirmation is available."
          (config (agent-switch--read-toml-file path))
          (payload (agent-switch-profile-payload profile))
          (provider-id (gethash "provider-id" payload))
+         (live-provider-id
+          (agent-switch--codex-live-provider-id
+           provider-id (gethash "credential" payload)))
          (model (gethash "model" payload))
          (small-model (gethash "small-model" payload))
+         (credential (gethash "credential" payload))
          (patch (or (gethash "provider" payload)
                     (make-hash-table :test #'equal)))
          (providers (or (agent-switch--alist-get "model_providers" config) nil))
          (existing (or (and (agent-switch--toml-table-p providers)
-                            (agent-switch--alist-get provider-id providers))
+                            (agent-switch--alist-get live-provider-id providers))
                        nil))
          (merged (agent-switch-json-deep-merge
                   (agent-switch--toml-to-json existing) patch)))
-    (setq config (agent-switch--alist-set "model_provider" provider-id config))
+    (when credential
+      (dolist (key '("env_key" "env_key_instructions" "env_http_headers"
+                     "experimental_bearer_token" "requires_openai_auth"))
+        (remhash key merged))
+      (puthash "auth" (agent-switch--codex-auth-table credential) merged))
+    (setq config (agent-switch--alist-set
+                  "model_provider" live-provider-id config))
     (setq config (agent-switch--alist-set "model" model config))
     (setq config (if (and (stringp small-model)
                           (not (string-empty-p small-model)))
@@ -485,7 +747,7 @@ CONTEXT determines whether an interactive confirmation is available."
     (unless (agent-switch--toml-table-p providers)
       (setq providers nil))
     (setq providers
-          (agent-switch--alist-set provider-id
+          (agent-switch--alist-set live-provider-id
                                    (agent-switch--json-to-toml merged)
                                    providers))
     (setq config (agent-switch--alist-set "model_providers" providers config))
@@ -497,97 +759,19 @@ CONTEXT determines whether an interactive confirmation is available."
 
 (defun agent-switch--codex-profile-current-p (_client profile current _context)
   "Return non-nil when Codex PROFILE matches CURRENT."
-  (agent-switch--json-subset-p (agent-switch-profile-payload profile) current))
+  (let ((payload (agent-switch-profile-payload profile)))
+    (and (hash-table-p current)
+         (equal (gethash "provider-id" payload) (gethash "provider-id" current))
+         (equal (gethash "model" payload) (gethash "model" current))
+         (agent-switch--optional-field-match-p "small-model" payload current)
+         (agent-switch--optional-field-match-p "credential" payload current)
+         (agent-switch--json-subset-p
+          (or (gethash "provider" payload) (make-hash-table :test #'equal))
+          (or (gethash "provider" current) (make-hash-table :test #'equal))))))
 
 (defun agent-switch--codex-watch-paths (_client _context)
   "Return paths watched for Codex changes."
   (list (agent-switch--codex-config-path)))
-
-;;; gptel defaults
-
-(defun agent-switch--ensure-gptel ()
-  "Load gptel or signal a clear error."
-  (unless (require 'gptel nil t)
-    (signal 'agent-switch-error '("gptel is not installed"))))
-
-(defun agent-switch--gptel-backend-name (backend)
-  "Return stable string name for gptel BACKEND."
-  (and backend (gptel-backend-name backend)))
-
-(defun agent-switch--gptel-current (_client _context)
-  "Return gptel global default backend and model.
-Return nil when no backend is configured."
-  (agent-switch--ensure-gptel)
-  (let ((backend (default-toplevel-value 'gptel-backend))
-        (model (default-toplevel-value 'gptel-model)))
-    (when backend
-      (let ((payload (make-hash-table :test #'equal)))
-        (puthash "backend-name" (agent-switch--gptel-backend-name backend) payload)
-        (when model
-          (puthash "model" (if (symbolp model) (symbol-name model) model) payload))
-        payload))))
-
-(defun agent-switch--gptel-models-for-backend (backend-name)
-  "Return model name strings for gptel BACKEND-NAME."
-  (agent-switch--ensure-gptel)
-  (mapcar (lambda (model)
-            (if (symbolp model) (symbol-name model) (format "%s" model)))
-          (gptel-backend-models (gptel-get-backend backend-name))))
-
-(defun agent-switch--gptel-validate (_client profile _context)
-  "Validate gptel PROFILE references."
-  (let* ((payload (agent-switch-profile-payload profile))
-         (backend-name (gethash "backend-name" payload))
-         (model (gethash "model" payload)))
-    (unless (and (stringp backend-name) (not (string-empty-p backend-name)))
-      (signal 'agent-switch-validation-error '("gptel backend-name is required")))
-    (unless (and (stringp model) (not (string-empty-p model)))
-      (signal 'agent-switch-validation-error '("gptel model is required")))
-    (unless (member model (agent-switch--gptel-models-for-backend backend-name))
-      (signal 'agent-switch-validation-error
-              (list (format "Model %s is not registered for backend %s"
-                            model backend-name))))
-    t))
-
-(defun agent-switch--gptel-snapshot (_client _profile _context)
-  "Snapshot gptel global defaults."
-  (agent-switch--ensure-gptel)
-  (list (default-toplevel-value 'gptel-backend)
-        (default-toplevel-value 'gptel-model)))
-
-(defun agent-switch--gptel-activate (_client profile _context)
-  "Activate gptel PROFILE as global defaults."
-  (agent-switch--ensure-gptel)
-  (let* ((payload (agent-switch-profile-payload profile))
-         (backend-name (gethash "backend-name" payload))
-         (model (gethash "model" payload)))
-    (set-default-toplevel-value 'gptel-backend
-                                (gptel-get-backend backend-name))
-    (set-default-toplevel-value 'gptel-model (intern model))
-    t))
-
-(defun agent-switch--gptel-rollback (_client snapshot _context)
-  "Restore gptel defaults from SNAPSHOT."
-  (set-default-toplevel-value 'gptel-backend (nth 0 snapshot))
-  (set-default-toplevel-value 'gptel-model (nth 1 snapshot))
-  t)
-
-(defun agent-switch--gptel-profile-current-p (_client profile current _context)
-  "Return non-nil when gptel PROFILE matches CURRENT defaults."
-  (agent-switch--json-subset-p (agent-switch-profile-payload profile) current))
-
-(defun agent-switch--gptel-watch-setup (_client callback)
-  "Watch gptel default variables and invoke CALLBACK after changes.
-Return a cleanup function removing both variable watchers."
-  (agent-switch--ensure-gptel)
-  (let ((watcher (lambda (_symbol _new-value operation _where)
-                   (when (memq operation '(set let unlet makunbound))
-                     (funcall callback)))))
-    (add-variable-watcher 'gptel-backend watcher)
-    (add-variable-watcher 'gptel-model watcher)
-    (lambda ()
-      (remove-variable-watcher 'gptel-backend watcher)
-      (remove-variable-watcher 'gptel-model watcher))))
 
 ;;; OpenCode global JSON/JSONC
 
@@ -756,7 +940,14 @@ Return nil when no model is configured."
 
 (defun agent-switch--opencode-profile-current-p (_client profile current _context)
   "Return non-nil when OpenCode PROFILE matches CURRENT."
-  (agent-switch--json-subset-p (agent-switch-profile-payload profile) current))
+  (let ((payload (agent-switch-profile-payload profile)))
+    (and (hash-table-p current)
+         (equal (gethash "provider-id" payload) (gethash "provider-id" current))
+         (equal (gethash "model" payload) (gethash "model" current))
+         (agent-switch--optional-field-match-p "small-model" payload current)
+         (agent-switch--json-subset-p
+          (or (gethash "provider" payload) (make-hash-table :test #'equal))
+          (or (gethash "provider" current) (make-hash-table :test #'equal))))))
 
 (defun agent-switch--opencode-watch-paths (_client _context)
   "Return paths watched for OpenCode global changes."
@@ -769,6 +960,36 @@ Return nil when no model is configured."
   (let ((object (make-hash-table :test #'equal)))
     (dolist (entry entries object)
       (puthash (car entry) (cdr entry) object))))
+
+(defun agent-switch--claude-profile-columns (_client profile _context)
+  "Return Claude model and provider Base URL columns for PROFILE."
+  (let* ((env (gethash "env" (agent-switch-profile-payload profile)))
+         (model (and (hash-table-p env)
+                     (or (gethash "ANTHROPIC_MODEL" env)
+                         (gethash "ANTHROPIC_DEFAULT_SONNET_MODEL" env)
+                         (gethash "ANTHROPIC_DEFAULT_OPUS_MODEL" env)
+                         (gethash "ANTHROPIC_DEFAULT_HAIKU_MODEL" env))))
+         (base-url (and (hash-table-p env)
+                        (gethash "ANTHROPIC_BASE_URL" env))))
+    (list :model model :base-url base-url)))
+
+(defun agent-switch--codex-profile-columns (_client profile _context)
+  "Return Codex model and provider Base URL columns for PROFILE."
+  (let* ((payload (agent-switch-profile-payload profile))
+         (provider (gethash "provider" payload)))
+    (list :model (gethash "model" payload)
+          :base-url (and (hash-table-p provider)
+                         (gethash "base_url" provider)))))
+
+(defun agent-switch--opencode-profile-columns (_client profile _context)
+  "Return OpenCode model and provider Base URL columns for PROFILE."
+  (let* ((payload (agent-switch-profile-payload profile))
+         (provider (gethash "provider" payload))
+         (options (and (hash-table-p provider)
+                       (gethash "options" provider))))
+    (list :model (gethash "model" payload)
+          :base-url (and (hash-table-p options)
+                         (gethash "baseURL" options)))))
 
 (defun agent-switch--claude-profile-template (_client _context)
   "Return a new Claude Profile payload template."
@@ -785,12 +1006,10 @@ Return nil when no model is configured."
   (agent-switch--template-object
    '("provider-id" . "") '("model" . "") '("small-model" . "")
    (cons "provider" (agent-switch--template-object
-                     '("base_url" . "") '("env_key" . "")
-                     '("wire_api" . "responses")))))
-
-(defun agent-switch--gptel-profile-template (_client _context)
-  "Return a new gptel Profile payload template."
-  (agent-switch--template-object '("backend-name" . "") '("model" . "")))
+                     '("base_url" . "")
+                     '("wire_api" . "responses")))
+   (cons "credential"
+         (agent-switch--auth-source-reference "" "" "command"))))
 
 (defun agent-switch--opencode-profile-template (_client _context)
   "Return a new OpenCode Profile payload template."
@@ -811,49 +1030,42 @@ Return nil when no model is configured."
     :snapshot #'agent-switch--claude-snapshot
     :rollback #'agent-switch--rollback-files
     :profile-current-p #'agent-switch--claude-profile-current-p
+    :capture-current #'agent-switch--capture-current
     :watch-paths #'agent-switch--claude-watch-paths
-    :profile-template #'agent-switch--claude-profile-template)
+    :profile-template #'agent-switch--claude-profile-template
+    :profile-columns #'agent-switch--claude-profile-columns)
   (agent-switch-register-client 'claude :name "Claude Code" :adapter 'claude)
 
   (agent-switch-define-adapter codex
     :name "Codex"
+    :payload-version 2
     :current #'agent-switch--codex-current
     :activate #'agent-switch--codex-activate
     :validate #'agent-switch--codex-validate
     :snapshot #'agent-switch--codex-snapshot
     :rollback #'agent-switch--rollback-files
     :profile-current-p #'agent-switch--codex-profile-current-p
+    :capture-current #'agent-switch--capture-current
     :watch-paths #'agent-switch--codex-watch-paths
-    :profile-template #'agent-switch--codex-profile-template)
+    :profile-template #'agent-switch--codex-profile-template
+    :profile-columns #'agent-switch--codex-profile-columns)
   (agent-switch-register-client 'codex :name "Codex" :adapter 'codex)
 
-  (agent-switch-define-adapter gptel-default
-    :name "gptel Default"
-    :current #'agent-switch--gptel-current
-    :activate #'agent-switch--gptel-activate
-    :validate #'agent-switch--gptel-validate
-    :snapshot #'agent-switch--gptel-snapshot
-    :rollback #'agent-switch--gptel-rollback
-    :profile-current-p #'agent-switch--gptel-profile-current-p
-    :watch-setup #'agent-switch--gptel-watch-setup
-    :profile-template #'agent-switch--gptel-profile-template)
-  (agent-switch-register-client 'gptel-default
-                                :name "gptel Default"
-                                :adapter 'gptel-default)
-
-  (agent-switch-define-adapter opencode-global
-    :name "OpenCode Global"
+  (agent-switch-define-adapter opencode
+    :name "OpenCode"
     :current #'agent-switch--opencode-current
     :activate #'agent-switch--opencode-activate
     :validate #'agent-switch--opencode-validate
     :snapshot #'agent-switch--opencode-snapshot
     :rollback #'agent-switch--rollback-files
     :profile-current-p #'agent-switch--opencode-profile-current-p
+    :capture-current #'agent-switch--capture-current
     :watch-paths #'agent-switch--opencode-watch-paths
-    :profile-template #'agent-switch--opencode-profile-template)
-  (agent-switch-register-client 'opencode-global
-                                :name "OpenCode Global"
-                                :adapter 'opencode-global))
+    :profile-template #'agent-switch--opencode-profile-template
+    :profile-columns #'agent-switch--opencode-profile-columns)
+  (agent-switch-register-client 'opencode
+                                :name "OpenCode"
+                                :adapter 'opencode))
 
 (agent-switch-register-builtins)
 

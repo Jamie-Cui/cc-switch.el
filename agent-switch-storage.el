@@ -17,17 +17,28 @@
 (require 'subr-x)
 (require 'agent-switch-core)
 
+(declare-function agent-switch-find-profile
+                  "agent-switch-operations" (client-id profile-id &optional noerror))
+(declare-function agent-switch-delete-managed-profile
+                  "agent-switch-operations" (profile))
+
 (defcustom agent-switch-directory
   (expand-file-name "agent-switch/" user-emacs-directory)
   "Directory containing managed profiles and state."
   :type 'directory
   :group 'agent-switch)
 
-(defconst agent-switch-storage-schema-version 1
-  "Current Profile and state JSON schema version.")
+(defcustom agent-switch-authinfo-file
+  (expand-file-name "~/.authinfo.gpg")
+  "Authinfo file used for managed secret references and command delivery."
+  :type 'file
+  :group 'agent-switch)
 
-(defconst agent-switch-json-null :null)
-(defconst agent-switch-json-false :false)
+(defconst agent-switch-storage-schema-version 1
+  "Current Profile JSON schema version.")
+
+(defconst agent-switch-state-schema-version 2
+  "Current state.json schema version.")
 
 (cl-defstruct (agent-switch-file-state
                (:constructor agent-switch--make-file-state))
@@ -36,9 +47,6 @@
 (cl-defstruct (agent-switch-state-record
                (:constructor agent-switch--make-state-record))
   data hash error)
-
-(defvar agent-switch--discovery-cache (make-hash-table :test #'equal)
-  "Asynchronous Adapter discovery results keyed by Client ID.")
 
 (defun agent-switch--directory ()
   "Return normalized `agent-switch-directory'."
@@ -211,90 +219,77 @@ CONTEXT is included in sanitized parse errors."
         result)
     (agent-switch-json-copy patch)))
 
-(defun agent-switch-secret-reference-p (value)
-  "Return non-nil when VALUE is a supported secret reference object."
-  (and (hash-table-p value)
-       (let ((source (gethash "source" value)))
-         (cond
-          ((equal source "env")
-           (let ((name (gethash "name" value)))
-             (and (stringp name)
-                  (string-match-p "\\`[[:alpha:]_][[:alnum:]_]*\\'" name))))
-          ((equal source "auth-source")
-           (let ((host (gethash "host" value)))
-             (and (stringp host) (not (string-empty-p host)))))
-          (t nil)))))
+(defun agent-switch--auth-source-matches (reference)
+  "Return auth-source matches for REFERENCE without stale search results."
+  (let* ((auth-source-do-cache nil)
+         (auth-sources (list (expand-file-name agent-switch-authinfo-file)))
+         (authinfo (gethash "authinfo" reference))
+         (machine (gethash "machine" authinfo))
+         (login (gethash "login" authinfo))
+         (port (gethash "port" authinfo)))
+    (apply #'auth-source-search
+           (append (list :host machine :max 1 :require '(:secret))
+                   (when login (list :user login))
+                   (when port (list :port port))))))
 
-(defconst agent-switch--sensitive-key-regexp
-  (rx (or "token" "secret" "password" "api-key" "api_key" "apikey"
-          "authorization" "auth-token" "auth_token"))
-  "Case-insensitive regexp identifying secret-bearing JSON keys.")
+(defun agent-switch--auth-source-reference-available-p (reference)
+  "Return non-nil when auth-source can match REFERENCE with a secret."
+  (condition-case nil
+      (not (null (agent-switch--auth-source-matches reference)))
+    (error nil)))
 
-(defun agent-switch-validate-no-plaintext-secrets (value &optional path)
-  "Signal if JSON VALUE contains a plaintext secret.
-PATH is used internally to identify sensitive keys without exposing values."
+(defun agent-switch--secret-references-available-p (value)
+  "Return non-nil when every secret reference below VALUE is available."
   (cond
+   ((agent-switch-secret-reference-p value)
+    (agent-switch--auth-source-reference-available-p value))
    ((hash-table-p value)
-    (maphash
-     (lambda (key child)
-       (let ((child-path (append path (list key))))
-         (when (and (stringp key)
-                    (string-match-p agent-switch--sensitive-key-regexp
-                                    (downcase key))
-                    (not (agent-switch-secret-reference-p child))
-                    (not (or (eq child agent-switch-json-null)
-                             (eq child agent-switch-json-false)
-                             (null child))))
-           (signal 'agent-switch-validation-error
-                   (list (format "Plaintext secret is not allowed at %s"
-                                 (string-join child-path ".")))))
-         (unless (agent-switch-secret-reference-p child)
-           (agent-switch-validate-no-plaintext-secrets child child-path))))
-     value))
+    (catch 'missing
+      (maphash
+       (lambda (_key child)
+         (unless (agent-switch--secret-references-available-p child)
+           (throw 'missing nil)))
+       value)
+      t))
    ((vectorp value)
-    (dotimes (index (length value))
-      (agent-switch-validate-no-plaintext-secrets
-       (aref value index)
-       (append path (list (number-to-string index))))))
+    (cl-loop for child across value
+             always (agent-switch--secret-references-available-p child)))
    ((consp value)
-    (dolist (child value)
-      (agent-switch-validate-no-plaintext-secrets child path))))
-  t)
+    (cl-every #'agent-switch--secret-references-available-p value))
+   (t t)))
 
 (defun agent-switch--resolve-secret-reference (reference)
   "Resolve secret REFERENCE or signal a sanitized error."
   (let ((source (gethash "source" reference)))
     (pcase source
-      ("env"
-       (let* ((name (gethash "name" reference))
-              (value (getenv name)))
-         (unless (and value (not (string-empty-p value)))
-           (signal 'agent-switch-error
-                   (list (format "Environment variable %s is not set" name))))
-         value))
       ("auth-source"
-       (let* ((host (gethash "host" reference))
-              (user (gethash "user" reference))
-              (port (gethash "port" reference))
-              (match (car (apply #'auth-source-search
-                                 (append (list :host host :max 1 :require '(:secret))
-                                         (when user (list :user user))
-                                         (when port (list :port port))))))
+       (let* ((authinfo (gethash "authinfo" reference))
+              (machine (gethash "machine" authinfo))
+              (match (car (agent-switch--auth-source-matches reference)))
               (secret (plist-get match :secret))
               (value (if (functionp secret) (funcall secret) secret)))
          (unless (and (stringp value) (not (string-empty-p value)))
            (signal 'agent-switch-error
-                   (list (format "No auth-source secret found for %s" host))))
+                   (list (format "No auth-source secret found for %s"
+                                 machine))))
          value))
       (_ (signal 'agent-switch-validation-error
-                 '("Unsupported secret reference"))))))
+                 '("Only auth-source secret references are supported"))))))
 
 (defun agent-switch--resolve-secrets (value secrets)
   "Return (RESOLVED . SECRETS) for JSON VALUE and accumulated SECRETS."
   (cond
    ((agent-switch-secret-reference-p value)
-    (let ((secret (agent-switch--resolve-secret-reference value)))
-      (cons secret (cons secret secrets))))
+    (if (equal (gethash "delivery" value) "command")
+        (if (agent-switch--auth-source-reference-available-p value)
+            (cons (agent-switch-json-copy value) secrets)
+          (let* ((authinfo (gethash "authinfo" value))
+                 (machine (gethash "machine" authinfo)))
+            (signal 'agent-switch-error
+                    (list (format "No auth-source secret found for %s"
+                                  machine)))))
+      (let ((secret (agent-switch--resolve-secret-reference value)))
+        (cons secret (cons secret secrets)))))
    ((hash-table-p value)
     (let ((copy (make-hash-table :test #'equal))
           (values secrets))
@@ -342,7 +337,14 @@ PATH is used internally to identify sensitive keys without exposing values."
     (puthash "id" (agent-switch-profile-id profile) object)
     (puthash "client" (agent-switch-profile-client-id profile) object)
     (puthash "name" (agent-switch-profile-name profile) object)
+    (puthash "payload_schema_version"
+             (or (agent-switch-profile-payload-version profile) 1) object)
     (puthash "payload" (agent-switch-profile-payload profile) object)
+    (when (agent-switch-profile-setup-required-p profile)
+      (puthash "setup_required" t object)
+      (puthash "warnings"
+               (vconcat (or (agent-switch-profile-warnings profile) nil))
+               object))
     object))
 
 (defun agent-switch--profile-from-json (path client-id object hash)
@@ -351,7 +353,10 @@ PATH is used internally to identify sensitive keys without exposing values."
         (id (gethash "id" object))
         (stored-client (gethash "client" object))
         (name (gethash "name" object))
-        (payload (gethash "payload" object)))
+        (payload-version (or (gethash "payload_schema_version" object) 1))
+        (payload (gethash "payload" object))
+        (setup-required-p (eq (gethash "setup_required" object) t))
+        (warnings (append (or (gethash "warnings" object) []) nil)))
     (unless (equal version agent-switch-storage-schema-version)
       (signal 'agent-switch-validation-error
               (list (format "Unsupported profile schema version: %S" version))))
@@ -368,10 +373,17 @@ PATH is used internally to identify sensitive keys without exposing values."
       (signal 'agent-switch-validation-error
               '("Profile payload must be a JSON object")))
     (agent-switch-validate-no-plaintext-secrets payload)
+    (unless (and (integerp payload-version) (> payload-version 0))
+      (signal 'agent-switch-validation-error
+              '("Profile payload schema version must be a positive integer")))
+    (unless (cl-every #'stringp warnings)
+      (signal 'agent-switch-validation-error
+              '("Profile warnings must be strings")))
     (agent-switch--make-profile
      :id id :client-id client-id :name name
      :payload payload :ownership 'managed :source path :source-hash hash
-     :valid-p t)))
+     :valid-p t :payload-version payload-version
+     :setup-required-p setup-required-p :warnings warnings)))
 
 (defun agent-switch--invalid-profile (path client-id error-value hash)
   "Return an invalid profile for PATH and CLIENT-ID.
@@ -411,82 +423,6 @@ ERROR-VALUE is sanitized for display and HASH records the source content."
             (string-lessp (agent-switch-profile-id left)
                           (agent-switch-profile-id right))))))
 
-(defun agent-switch--adapter-discovered-profiles (client)
-  "Return Adapter-discovered profiles for CLIENT.
-Asynchronous discovery is cached and announces completion through
-`agent-switch-data-changed-hook'."
-  (let* ((adapter (agent-switch-get-adapter
-                   (agent-switch-client-adapter-id client)))
-         (discover (agent-switch-adapter-callback adapter :discover))
-         (client-id (agent-switch-client-id client))
-         (cached (gethash client-id agent-switch--discovery-cache)))
-    (when discover
-      (pcase (plist-get cached :status)
-        ('ready (plist-get cached :value))
-        ('pending nil)
-        ('error
-         (signal 'agent-switch-error (list (plist-get cached :error))))
-        (_
-         (let ((result (funcall discover client nil)))
-           (if (not (agent-switch-job-p result))
-               result
-             (puthash client-id (list :status 'pending :job result)
-                      agent-switch--discovery-cache)
-             (agent-switch-job-start
-              result
-              (lambda (profiles)
-                (puthash client-id (list :status 'ready :value profiles)
-                         agent-switch--discovery-cache)
-                (run-hook-with-args 'agent-switch-data-changed-hook client-id))
-              (lambda (error-value)
-                (puthash client-id
-                         (list :status 'error
-                               :error (agent-switch--safe-error-message error-value))
-                         agent-switch--discovery-cache)
-                (run-hook-with-args 'agent-switch-data-changed-hook client-id)))
-             nil)))))))
-
-(defun agent-switch-profile-discovery-status (client-id)
-  "Return cached asynchronous discovery status for CLIENT-ID, or nil."
-  (setq client-id (agent-switch--string-id client-id "client"))
-  (plist-get (gethash client-id agent-switch--discovery-cache) :status))
-
-(defun agent-switch-invalidate-discovery (&optional client-id)
-  "Invalidate asynchronous discovery cache for CLIENT-ID or all clients."
-  (if client-id
-      (progn
-        (when-let* ((entry (gethash client-id agent-switch--discovery-cache))
-                    (job (and (eq (plist-get entry :status) 'pending)
-                              (plist-get entry :job))))
-          (agent-switch-job-cancel job))
-        (remhash client-id agent-switch--discovery-cache))
-    (maphash (lambda (_id entry)
-               (when-let* ((job (and (eq (plist-get entry :status) 'pending)
-                                     (plist-get entry :job))))
-                 (agent-switch-job-cancel job)))
-             agent-switch--discovery-cache)
-    (clrhash agent-switch--discovery-cache)))
-
-(defun agent-switch-profiles (client-id)
-  "Return managed and external profiles for CLIENT-ID ordered by ID."
-  (let* ((client (agent-switch-get-client client-id))
-         (profiles (append (agent-switch-load-managed-profiles client-id)
-                           (agent-switch-external-profiles client-id)
-                           (agent-switch--adapter-discovered-profiles client))))
-    (sort profiles
-          (lambda (left right)
-            (string-lessp (agent-switch-profile-id left)
-                          (agent-switch-profile-id right))))))
-
-(defun agent-switch-find-profile (client-id profile-id &optional noerror)
-  "Return CLIENT-ID PROFILE-ID.
-When NOERROR is non-nil, return nil on absence."
-  (or (cl-find profile-id (agent-switch-profiles client-id)
-               :key #'agent-switch-profile-id :test #'equal)
-      (unless noerror
-        (signal 'agent-switch-error
-                (list (format "Unknown profile %s/%s" client-id profile-id))))))
-
 (defun agent-switch-save-profile (profile)
   "Validate and atomically save managed PROFILE."
   (unless (eq (agent-switch-profile-ownership profile) 'managed)
@@ -507,6 +443,12 @@ When NOERROR is non-nil, return nil on absence."
               '("Profile payload must be a JSON object")))
     (agent-switch-validate-no-plaintext-secrets
      (agent-switch-profile-payload profile))
+    (unless (agent-switch-profile-payload-version profile)
+      (setf (agent-switch-profile-payload-version profile)
+            (agent-switch-adapter-payload-version
+             (agent-switch-get-adapter
+              (agent-switch-client-adapter-id
+               (agent-switch-get-client client-id))))))
     (let ((hash (agent-switch-write-text-atomic
                  path
                  (agent-switch-json-serialize
@@ -518,26 +460,51 @@ When NOERROR is non-nil, return nil on absence."
       profile)))
 
 (defun agent-switch-delete-profile (profile)
-  "Delete managed PROFILE using optimistic concurrency."
-  (unless (eq (agent-switch-profile-ownership profile) 'managed)
-    (signal 'agent-switch-validation-error
-            '("External profiles cannot be deleted")))
-  (agent-switch-delete-file-optimistic
-   (agent-switch-profile-source profile)
-   (agent-switch-profile-source-hash profile))
-  (agent-switch-state-remove-profile
-   (agent-switch-profile-client-id profile)
-   (agent-switch-profile-id profile)))
+  "Delete managed PROFILE through the recoverable operations layer."
+  (require 'agent-switch-operations)
+  (agent-switch-delete-managed-profile profile))
 
 (defun agent-switch--empty-state ()
   "Return a new versioned state object."
   (let ((object (make-hash-table :test #'equal)))
-    (puthash "schema_version" agent-switch-storage-schema-version object)
-    (puthash "last_selected" (make-hash-table :test #'equal) object)
-    (puthash "applied_profiles" (make-hash-table :test #'equal) object)
+    (puthash "schema_version" agent-switch-state-schema-version object)
+    (puthash "selections" (make-hash-table :test #'equal) object)
+    (puthash "initialized_clients" (make-hash-table :test #'equal) object)
     (puthash "unprotected_confirmed" [] object)
     (puthash "canonical_confirmations" (make-hash-table :test #'equal) object)
     object))
+
+(defun agent-switch--migrate-state-v1 (old)
+  "Return state schema v2 migrated from OLD schema v1 data."
+  (let* ((new (agent-switch--empty-state))
+         (selected (gethash "last_selected" old))
+         (applied (gethash "applied_profiles" old))
+         (sources (gethash "selection_sources" old))
+         (selections (gethash "selections" new))
+         (initialized (gethash "initialized_clients" new)))
+    (when (hash-table-p selected)
+      (maphash
+       (lambda (client-id profile-id)
+         (let* ((snapshot (and (hash-table-p applied)
+                               (gethash client-id applied)))
+                (selection (make-hash-table :test #'equal)))
+           (puthash "profile_id" profile-id selection)
+           (puthash "payload"
+                    (and (hash-table-p snapshot)
+                         (gethash "payload" snapshot))
+                    selection)
+           (puthash "source"
+                    (or (and (hash-table-p sources)
+                             (gethash client-id sources))
+                        "applied")
+                    selection)
+           (puthash client-id selection selections)
+           (puthash client-id t initialized)))
+       selected))
+    (dolist (key '("unprotected_confirmed" "canonical_confirmations"))
+      (when-let* ((value (gethash key old)))
+        (puthash key (agent-switch-json-copy value) new)))
+    new))
 
 (defun agent-switch-read-state ()
   "Read state and return an `agent-switch-state-record'."
@@ -549,11 +516,15 @@ When NOERROR is non-nil, return nil on absence."
              (hash (agent-switch-content-hash
                     (agent-switch--read-file-bytes path))))
         (condition-case error-value
-            (let ((data (agent-switch-parse-json text "state.json")))
-              (unless (equal (gethash "schema_version" data)
-                             agent-switch-storage-schema-version)
-                (signal 'agent-switch-validation-error
-                        '("Unsupported state schema version")))
+            (let* ((parsed (agent-switch-parse-json text "state.json"))
+                   (version (gethash "schema_version" parsed))
+                   (data
+                    (cond
+                     ((equal version agent-switch-state-schema-version) parsed)
+                     ((equal version 1) (agent-switch--migrate-state-v1 parsed))
+                     (t
+                      (signal 'agent-switch-validation-error
+                              '("Unsupported state schema version"))))))
               (agent-switch--make-state-record :data data :hash hash))
           (error
            (agent-switch--make-state-record
@@ -597,47 +568,82 @@ When NOERROR is non-nil, return nil on absence."
 (defun agent-switch-state-last-selected (client-id)
   "Return last selected Profile ID for CLIENT-ID."
   (let* ((data (agent-switch-state-record-data (agent-switch-read-state)))
-         (last-selected (gethash "last_selected" data)))
-    (and (hash-table-p last-selected)
-         (gethash client-id last-selected))))
+         (selections (gethash "selections" data))
+         (selection (and (hash-table-p selections)
+                         (gethash client-id selections))))
+    (and (hash-table-p selection) (gethash "profile_id" selection))))
 
-(defun agent-switch-state-set-last-selected (client-id profile-id &optional profile-object)
+(defun agent-switch-state-client-initialized-p (client-id)
+  "Return non-nil when CLIENT-ID has completed first-run initialization."
+  (setq client-id (agent-switch--string-id client-id "client"))
+  (let* ((data (agent-switch-state-record-data (agent-switch-read-state)))
+         (initialized (gethash "initialized_clients" data)))
+    (and (hash-table-p initialized)
+         (eq (gethash client-id initialized) t))))
+
+(defun agent-switch--state-put-selection (data client-id profile source)
+  "Put PROFILE selection for CLIENT-ID into state DATA with SOURCE."
+  (let ((selection (make-hash-table :test #'equal))
+        (selections (or (gethash "selections" data)
+                        (let ((new (make-hash-table :test #'equal)))
+                          (puthash "selections" new data)
+                          new))))
+    (puthash "profile_id" (agent-switch-profile-id profile) selection)
+    (puthash "payload" (agent-switch-json-copy
+                        (agent-switch-profile-payload profile)) selection)
+    (puthash "source" source selection)
+    (puthash client-id selection selections)))
+
+(defun agent-switch-state-set-last-selected
+    (client-id profile-id &optional profile-object source)
   "Record PROFILE-ID and its applied payload snapshot for CLIENT-ID."
   (agent-switch-update-state
    (lambda (data)
-     (let* ((profile (or profile-object
-                         (agent-switch-find-profile client-id profile-id)))
-            (snapshot (make-hash-table :test #'equal))
-            (selected (or (gethash "last_selected" data)
-                          (let ((new (make-hash-table :test #'equal)))
-                            (puthash "last_selected" new data)
-                            new)))
-            (applied (or (gethash "applied_profiles" data)
-                         (let ((new (make-hash-table :test #'equal)))
-                           (puthash "applied_profiles" new data)
-                           new))))
-       (puthash "payload" (agent-switch-json-copy
-                           (agent-switch-profile-payload profile)) snapshot)
-       (puthash client-id profile-id selected)
-       (puthash client-id snapshot applied)))))
+     (let ((profile (or profile-object
+                        (agent-switch-find-profile client-id profile-id))))
+       (agent-switch--state-put-selection
+        data client-id profile (or source "applied"))))))
+
+(defun agent-switch-state-finish-client-initialization
+    (client-id &optional selected-profile)
+  "Mark CLIENT-ID initialized and optionally select SELECTED-PROFILE.
+The marker survives Profile deletion so first-run capture is not repeated."
+  (setq client-id (agent-switch--string-id client-id "client"))
+  (agent-switch-update-state
+   (lambda (data)
+     (let ((initialized
+            (or (gethash "initialized_clients" data)
+                (let ((new (make-hash-table :test #'equal)))
+                  (puthash "initialized_clients" new data)
+                  new))))
+       (unless (hash-table-p initialized)
+         (signal 'agent-switch-validation-error
+                 '("state initialized_clients must be an object")))
+       (puthash client-id t initialized)
+       (when selected-profile
+         (agent-switch--state-put-selection
+          data client-id selected-profile "adopted"))))))
+
+(defun agent-switch-state-selection (client-id)
+  "Return structured selected Profile state for CLIENT-ID, or nil."
+  (let* ((data (agent-switch-state-record-data (agent-switch-read-state)))
+         (selections (gethash "selections" data)))
+    (and (hash-table-p selections) (gethash client-id selections))))
 
 (defun agent-switch-state-applied-profile (client-id)
-  "Return the applied Profile snapshot for CLIENT-ID, or nil."
-  (let* ((data (agent-switch-state-record-data (agent-switch-read-state)))
-         (applied (gethash "applied_profiles" data)))
-    (and (hash-table-p applied) (gethash client-id applied))))
+  "Return the selected Profile snapshot for CLIENT-ID, or nil."
+  (agent-switch-state-selection client-id))
 
 (defun agent-switch-state-remove-profile (client-id profile-id)
   "Remove PROFILE-ID references for CLIENT-ID from state."
   (agent-switch-update-state
    (lambda (data)
-     (let ((last-selected (gethash "last_selected" data))
-           (applied (gethash "applied_profiles" data)))
-       (when (and (hash-table-p last-selected)
-                  (equal (gethash client-id last-selected) profile-id))
-         (remhash client-id last-selected)
-         (when (hash-table-p applied)
-           (remhash client-id applied)))))))
+     (let* ((selections (gethash "selections" data))
+            (selection (and (hash-table-p selections)
+                            (gethash client-id selections))))
+       (when (and (hash-table-p selection)
+                  (equal (gethash "profile_id" selection) profile-id))
+         (remhash client-id selections))))))
 
 (defun agent-switch-state-unprotected-confirmed-p (adapter-id)
   "Return non-nil if ADAPTER-ID activation risk was confirmed."
