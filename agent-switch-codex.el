@@ -191,13 +191,7 @@
 (defun agent-switch--codex-credential-reference (provider-id provider)
   "Return a command-delivered authinfo reference for PROVIDER-ID PROVIDER."
   (agent-switch--auth-source-reference
-   (or (and (hash-table-p provider)
-            (let ((base-url (agent-switch--find-provider-base-url provider)))
-              (and base-url
-                   (condition-case nil
-                       (url-host (url-generic-parse-url base-url))
-                     (error nil)))))
-       provider-id)
+   (agent-switch--provider-authinfo-machine provider provider-id)
    (format "codex.%s.api-key" provider-id)
    "command"
    (agent-switch--codex-secret-location-comments)))

@@ -173,6 +173,13 @@ PATH is used internally to identify sensitive keys without exposing values."
             '("Profile payload must be a JSON object")))
   (agent-switch-validate-no-plaintext-secrets
    (agent-switch-profile-payload profile))
+  (when-let* ((payload-version (agent-switch-profile-payload-version profile)))
+    (unless (and (integerp payload-version) (> payload-version 0))
+      (signal 'agent-switch-validation-error
+              '("Profile payload schema version must be a positive integer"))))
+  (unless (cl-every #'stringp (or (agent-switch-profile-warnings profile) nil))
+    (signal 'agent-switch-validation-error
+            '("Profile warnings must be strings")))
   (when (and (agent-switch-profile-setup-required-p profile)
              (not allow-incomplete))
     (signal 'agent-switch-validation-error
@@ -396,13 +403,33 @@ The CLIENT object is prepended to ARGUMENTS.  Return a direct value or Job."
 
 ;; Storage-owned functions are declared here to keep the activation protocol
 ;; usable without introducing a circular require.
-(declare-function agent-switch-profiles "agent-switch-operations" (client-id))
 (declare-function agent-switch-resolve-profile-secrets "agent-switch-storage" (profile))
-(declare-function agent-switch-state-last-selected "agent-switch-storage" (client-id))
 (declare-function agent-switch-state-set-last-selected "agent-switch-storage"
                   (client-id profile-id &optional profile))
-(declare-function agent-switch-state-unprotected-confirmed-p "agent-switch-storage" (adapter-id))
-(declare-function agent-switch-state-confirm-unprotected "agent-switch-storage" (adapter-id))
+
+(defun agent-switch-validate-profile-for-client
+    (client profile &optional allow-incomplete)
+  "Validate PROFILE invariants and compatibility with CLIENT.
+When ALLOW-INCOMPLETE is non-nil, permit setup-required Profiles."
+  (unless (agent-switch-profile-valid-p profile)
+    (signal 'agent-switch-validation-error
+            (list (or (agent-switch-profile-error profile)
+                      "Profile is invalid"))))
+  (agent-switch-validate-profile-base profile allow-incomplete)
+  (unless (equal (agent-switch-client-id client)
+                 (agent-switch-profile-client-id profile))
+    (signal 'agent-switch-validation-error
+            '("Profile belongs to another client")))
+  (let* ((adapter (agent-switch-get-adapter
+                   (agent-switch-client-adapter-id client)))
+         (expected-version (agent-switch-adapter-payload-version adapter))
+         (actual-version (or (agent-switch-profile-payload-version profile) 1)))
+    (unless (= actual-version expected-version)
+      (signal 'agent-switch-validation-error
+              (list
+               (format "Profile payload schema version %s is not supported; expected %s"
+                       actual-version expected-version)))))
+  profile)
 
 (defun agent-switch--activation-context (client profile interactivep)
   "Create activation context for CLIENT and PROFILE.
@@ -415,24 +442,7 @@ INTERACTIVEP records whether a user initiated the operation."
 (defun agent-switch-activation-job (client profile &optional interactivep)
   "Return a transactional activation Job for CLIENT and PROFILE.
 INTERACTIVEP is recorded in the adapter context."
-  (unless (agent-switch-profile-valid-p profile)
-    (signal 'agent-switch-validation-error
-            (list (or (agent-switch-profile-error profile)
-                      "Profile is invalid"))))
-  (agent-switch-validate-profile-base profile)
-  (unless (equal (agent-switch-client-id client)
-                 (agent-switch-profile-client-id profile))
-    (signal 'agent-switch-validation-error
-            (list "Profile belongs to another client")))
-  (let* ((adapter (agent-switch-get-adapter
-                   (agent-switch-client-adapter-id client)))
-         (expected-version (agent-switch-adapter-payload-version adapter))
-         (actual-version (or (agent-switch-profile-payload-version profile) 1)))
-    (unless (= actual-version expected-version)
-      (signal 'agent-switch-validation-error
-              (list
-               (format "Profile payload schema version %s is not supported; expected %s"
-                       actual-version expected-version)))))
+  (agent-switch-validate-profile-for-client client profile)
   (let* ((adapter (agent-switch-get-adapter
                    (agent-switch-client-adapter-id client)))
          (validate (agent-switch-adapter-callback adapter :validate))

@@ -126,6 +126,24 @@
         (signal 'agent-switch-error
                 (list (format "Unknown profile %s/%s" client-id profile-id))))))
 
+(defun agent-switch-profile-ready-p (profile)
+  "Return non-nil when PROFILE can be activated without setup work.
+This is a non-mutating readiness check for callers such as dashboards."
+  (and (agent-switch-profile-valid-p profile)
+       (not (agent-switch-profile-setup-required-p profile))
+       (condition-case nil
+           (let* ((client (agent-switch-get-client
+                           (agent-switch-profile-client-id profile)))
+                  (adapter (agent-switch-get-adapter
+                            (agent-switch-client-adapter-id client)))
+                  (validate (agent-switch-adapter-callback adapter :validate)))
+             (agent-switch-validate-profile-for-client client profile)
+             (and (agent-switch--secret-references-available-p
+                   (agent-switch-profile-payload profile))
+                  (or (not validate)
+                      (funcall validate client profile nil))))
+         (error nil))))
+
 (defun agent-switch-operation-running-p (client-id)
   "Return non-nil when CLIENT-ID has a mutating operation in progress."
   (gethash (agent-switch--string-id client-id "client")

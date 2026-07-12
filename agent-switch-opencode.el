@@ -9,7 +9,7 @@
 
 ;;; Code:
 
-(require 'cl-lib)
+(require 'subr-x)
 (require 'agent-switch-adapter-utils)
 
 (defcustom agent-switch-opencode-config-file nil

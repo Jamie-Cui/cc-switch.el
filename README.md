@@ -325,7 +325,8 @@ does not prompt, visit files, render buffers, or emit user messages:
 ```
 
 Other reusable operations are `agent-switch-create-managed-profile`,
-`agent-switch-adopt-capture`, and `agent-switch-delete-managed-profile`.
+`agent-switch-adopt-capture`, `agent-switch-delete-managed-profile`, and
+`agent-switch-profile-ready-p` for a non-mutating readiness check.
 
 ## Elisp Extensions
 

@@ -350,25 +350,7 @@ Prefer the Profile named by LAST-SELECTED."
   "Return non-nil when PROFILE needs setup before it can be applied."
   (or (agent-switch-profile-setup-required-p profile)
       (and (agent-switch-profile-valid-p profile)
-           (or (not (agent-switch--secret-references-available-p
-                     (agent-switch-profile-payload profile)))
-               (condition-case nil
-                   (let* ((client
-                           (agent-switch-get-client
-                            (agent-switch-profile-client-id profile)))
-                          (adapter
-                           (agent-switch-get-adapter
-                            (agent-switch-client-adapter-id client)))
-                          (expected-version
-                           (agent-switch-adapter-payload-version adapter))
-                          (actual-version
-                           (or (agent-switch-profile-payload-version profile) 1))
-                          (validate
-                           (agent-switch-adapter-callback adapter :validate)))
-                     (or (/= actual-version expected-version)
-                         (and validate
-                              (not (funcall validate client profile nil)))))
-                 (error t))))))
+           (not (agent-switch-profile-ready-p profile)))))
 
 (defun agent-switch--profile-name-cell (profile)
   "Return bounded name column for PROFILE with any required-action marker."

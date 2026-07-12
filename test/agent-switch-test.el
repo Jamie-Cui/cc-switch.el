@@ -1420,7 +1420,9 @@
       (agent-switch-define-adapter incomplete-adapter
         :current (lambda (_client _context) current)
         :activate (lambda (_client _profile _context) t)
-        :capture-current #'agent-switch--capture-current)
+        :capture-current
+        (lambda (client observed _context)
+          (agent-switch--capture-current-with-comments client observed nil)))
       (let ((client (agent-switch-register-client
                      'incomplete-client :adapter 'incomplete-adapter)))
         (with-temp-buffer
@@ -1679,7 +1681,7 @@
            (profile (agent-switch-test--profile
                      "claude" "snapshot" payload)))
       (agent-switch-state-set-last-selected "claude" "snapshot" profile)
-      (let ((applied (agent-switch-state-applied-profile "claude")))
+      (let ((applied (agent-switch-state-selection "claude")))
         (should (hash-table-p applied))
         (should-not (gethash "fingerprint" applied))
         (should (equal

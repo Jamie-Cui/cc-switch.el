@@ -124,18 +124,16 @@
              thereis (agent-switch--find-provider-base-url child)))
    (t nil)))
 
-(defun agent-switch--capture-authinfo-machine (client current)
-  "Return authinfo machine for CLIENT CURRENT provider state."
-  (let* ((base-url (agent-switch--find-provider-base-url current))
+(defun agent-switch--provider-authinfo-machine (value fallback)
+  "Return an authinfo machine derived from provider VALUE or FALLBACK."
+  (let* ((base-url (agent-switch--find-provider-base-url value))
          (machine (and base-url
                        (condition-case nil
                            (url-host (url-generic-parse-url base-url))
                          (error nil)))))
     (if (and (stringp machine) (not (string-empty-p machine)))
         machine
-      (if (agent-switch-client-p client)
-          (agent-switch-client-id client)
-        "agent-switch"))))
+      fallback)))
 
 (defun agent-switch--auth-source-reference
     (machine login &optional delivery comments)
@@ -192,16 +190,17 @@
 (defun agent-switch--capture-current-with-comments
     (client current comments)
   "Capture CLIENT CURRENT state with generated references carrying COMMENTS."
-  (let ((machine (agent-switch--capture-authinfo-machine client current)))
+  (let ((machine
+         (agent-switch--provider-authinfo-machine
+          current
+          (if (agent-switch-client-p client)
+              (agent-switch-client-id client)
+            "agent-switch"))))
     (agent-switch-capture-result-create
      :payload (agent-switch--capture-secret-safe-value
                current machine comments)
      :complete-p t
      :warnings nil)))
-
-(defun agent-switch--capture-current (client current _context)
-  "Capture CLIENT CURRENT state with generated auth-source references."
-  (agent-switch--capture-current-with-comments client current nil))
 
 (defun agent-switch--secret-reference-operational-copy (reference)
   "Copy REFERENCE without non-operational authinfo comments."

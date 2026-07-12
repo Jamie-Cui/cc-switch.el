@@ -367,23 +367,13 @@ CONTEXT is included in sanitized parse errors."
     (unless (equal stored-client client-id)
       (signal 'agent-switch-validation-error
               '("Profile belongs to another client")))
-    (unless (and (stringp name) (not (string-empty-p (string-trim name))))
-      (signal 'agent-switch-validation-error '("Profile name is required")))
-    (unless (hash-table-p payload)
-      (signal 'agent-switch-validation-error
-              '("Profile payload must be a JSON object")))
-    (agent-switch-validate-no-plaintext-secrets payload)
-    (unless (and (integerp payload-version) (> payload-version 0))
-      (signal 'agent-switch-validation-error
-              '("Profile payload schema version must be a positive integer")))
-    (unless (cl-every #'stringp warnings)
-      (signal 'agent-switch-validation-error
-              '("Profile warnings must be strings")))
-    (agent-switch--make-profile
-     :id id :client-id client-id :name name
-     :payload payload :ownership 'managed :source path :source-hash hash
-     :valid-p t :payload-version payload-version
-     :setup-required-p setup-required-p :warnings warnings)))
+    (agent-switch-validate-profile-base
+     (agent-switch--make-profile
+      :id id :client-id client-id :name name
+      :payload payload :ownership 'managed :source path :source-hash hash
+      :valid-p t :payload-version payload-version
+      :setup-required-p setup-required-p :warnings warnings)
+     t)))
 
 (defun agent-switch--invalid-profile (path client-id error-value hash)
   "Return an invalid profile for PATH and CLIENT-ID.
@@ -434,21 +424,13 @@ ERROR-VALUE is sanitized for display and HASH records the source content."
               (agent-switch-profile-id profile) "profile"))
          (path (agent-switch-profile-path client-id id))
          (expected (or (agent-switch-profile-source-hash profile) :missing)))
-    (unless (and (stringp (agent-switch-profile-name profile))
-                 (not (string-empty-p
-                       (string-trim (agent-switch-profile-name profile)))))
-      (signal 'agent-switch-validation-error '("Profile name is required")))
-    (unless (hash-table-p (agent-switch-profile-payload profile))
-      (signal 'agent-switch-validation-error
-              '("Profile payload must be a JSON object")))
-    (agent-switch-validate-no-plaintext-secrets
-     (agent-switch-profile-payload profile))
     (unless (agent-switch-profile-payload-version profile)
       (setf (agent-switch-profile-payload-version profile)
             (agent-switch-adapter-payload-version
              (agent-switch-get-adapter
               (agent-switch-client-adapter-id
                (agent-switch-get-client client-id))))))
+    (agent-switch-validate-profile-base profile t)
     (let ((hash (agent-switch-write-text-atomic
                  path
                  (agent-switch-json-serialize
@@ -458,11 +440,6 @@ ERROR-VALUE is sanitized for display and HASH records the source content."
             (agent-switch-profile-source-hash profile) hash
             (agent-switch-profile-valid-p profile) t)
       profile)))
-
-(defun agent-switch-delete-profile (profile)
-  "Delete managed PROFILE through the recoverable operations layer."
-  (require 'agent-switch-operations)
-  (agent-switch-delete-managed-profile profile))
 
 (defun agent-switch--empty-state ()
   "Return a new versioned state object."
@@ -629,10 +606,6 @@ The marker survives Profile deletion so first-run capture is not repeated."
   (let* ((data (agent-switch-state-record-data (agent-switch-read-state)))
          (selections (gethash "selections" data)))
     (and (hash-table-p selections) (gethash client-id selections))))
-
-(defun agent-switch-state-applied-profile (client-id)
-  "Return the selected Profile snapshot for CLIENT-ID, or nil."
-  (agent-switch-state-selection client-id))
 
 (defun agent-switch-state-remove-profile (client-id profile-id)
   "Remove PROFILE-ID references for CLIENT-ID from state."
